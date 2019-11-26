@@ -26,6 +26,7 @@
 #include <math.h>
 #include <string.h>
 #include <time.h>
+#include <fftw3.h>
 
 #if SDL
 #include <SDL.h>
@@ -50,7 +51,7 @@
 #define NUM_CELLS 256
 
 // number of particles
-#define NUM_PARTICLES 256
+#define NUM_PARTICLES 32
 
 // minimum and maximum geometries
 #define XMIN 0
@@ -64,7 +65,41 @@
 
 #define DT 0.0125;
 
+#define G 4.0*M_PI*M_PI;
+
 struct thread_data thread_data_array[NUM_THREADS];
+
+/* structure for RGB color */
+struct color{
+  double r;
+  double g;
+  double b;
+};
+
+void colormap(double val, struct color *col){
+  int nn;
+
+  double x_map[6]={0.0, 0.2, 0.45, 0.7, 0.85, 1.0};
+  double r_map[6]={0.0, 0.0, 0.0, 1.0, 1.0, 0.65};
+  double g_map[6]={0.0, 0.0, 1.0, 1.0, 0.0, 0.0};
+  double b_map[6]={0.65, 1.0, 1.0, 0.0, 0.0, 0.0};
+
+  /* crop value to fit the map */
+  if(val>0.99)
+    val=0.99;
+
+  val=1.0-val;
+  
+  /* linearly interpolate the value from the colormap */
+  for(nn=0;nn<(6-1);nn++){
+    if(val>x_map[nn]&&val<x_map[nn+1]){
+      col->r=r_map[nn]+(val-x_map[nn])*(r_map[nn+1]-r_map[nn])/(x_map[nn+1]-x_map[nn]);
+      col->g=g_map[nn]+(val-x_map[nn])*(g_map[nn+1]-g_map[nn])/(x_map[nn+1]-x_map[nn]);
+      col->b=b_map[nn]+(val-x_map[nn])*(b_map[nn+1]-b_map[nn])/(x_map[nn+1]-x_map[nn]);
+      break;
+    }
+  }
+}
 
 #if TIFF_ENABLE
 void writeframe(char* path, SDL_Surface *screen){
@@ -257,9 +292,19 @@ int main(int argc, char *argv[])
   double *a;
 
   double *rho;
+  double *phi;
+  double *green;
+  double *gr_hat;
+
+  double k_x, k_y;
+
+  fftw_complex *rho_hat, *green_rho_hat, *rho_complex, *phi_complex;
+  fftw_plan rho_plan, phi_plan;
   
   // time step variable
   double dt=DT;
+
+  struct color *col=0;
 
 #if SDL
   // SDL variables
@@ -323,14 +368,56 @@ int main(int argc, char *argv[])
     printf("Out of memory: a not allocated.\n");
     exit(1);
   }
-
   // density
   rho=(double *)malloc(NUM_CELLS*NUM_CELLS*sizeof(double));
   if(!rho){
     printf("Out of memory: rho not allocated.\n");
     exit(1);
   }
+  // potential
+  phi=(double *)malloc(NUM_CELLS*NUM_CELLS*sizeof(double));
+  if(!phi){
+    printf("Out of memory: phi not allocated.\n");
+    exit(1);
+  }
+  // green's function
+  green=(double *)malloc((NUM_CELLS/2)*(NUM_CELLS/2)*sizeof(double));
+  if(!green){
+    printf("Out of memory: green not allocated.\n");
+    exit(1);
+  }
+  gr_hat=(double *)malloc(NUM_CELLS*NUM_CELLS*sizeof(double));
+  if(!gr_hat){
+    printf("Out of memory: gr_hat not allocated.\n");
+    exit(1);
+  }
+  rho_complex = (fftw_complex*) fftw_malloc(sizeof(fftw_complex)*NUM_CELLS*NUM_CELLS);
+  if(!rho_complex){
+    printf("Out of memory: rho_complex not allocated.\n");
+    exit(1);
+  }
+  rho_hat = (fftw_complex*) fftw_malloc(sizeof(fftw_complex)*NUM_CELLS*NUM_CELLS);
+  if(!rho_hat){
+    printf("Out of memory: rho_hat not allocated.\n");
+    exit(1);
+  }
+  phi_complex = (fftw_complex*) fftw_malloc(sizeof(fftw_complex)*NUM_CELLS*NUM_CELLS);
+  if(!phi_complex){
+    printf("Out of memory: phi_complex not allocated.\n");
+    exit(1);
+  }
+  green_rho_hat = (fftw_complex*) fftw_malloc(sizeof(fftw_complex)*NUM_CELLS*NUM_CELLS);
+  if(!green_rho_hat){
+    printf("Out of memory: green_rho_hat not allocated.\n");
+    exit(1);
+  }
 
+  col=(struct color*)malloc(sizeof(struct color));
+  if(!col){
+    printf("Out of memory: col not allocated.\n");
+    exit(1);
+  }
+  
   // generate initial condition
   for(nn=0; nn<NUM_PARTICLES; nn++) {
     r[nn*NUM_DIMS + 0] = NUM_CELLS*(double)(rand())/RAND_MAX;
@@ -343,12 +430,41 @@ int main(int argc, char *argv[])
     a[nn*NUM_DIMS + 1] = 0.0;
   }
 
+  // compute gravitational green's function in k-space
+  for(jj=0; jj<NUM_CELLS/2; jj++) {
+    for(ii=0; ii<NUM_CELLS/2; ii++) {
+      k_x = 2.0*M_PI*(ii+1)/256.0;
+      k_y = 2.0*M_PI*(jj+1)/256.0;
+
+      green[jj*NUM_CELLS + ii] = -(1.0/4.0)*1.0/(sin(k_x/2.0)*sin(k_x/2.0)+sin(k_y/2.0)*sin(k_y/2.0));
+      gr_hat[jj*NUM_CELLS + ii] = green[jj*NUM_CELLS + ii];
+      gr_hat[jj*NUM_CELLS + (NUM_CELLS-ii-1)] = green[jj*NUM_CELLS + ii];
+      gr_hat[(NUM_CELLS-jj-1)*NUM_CELLS + (NUM_CELLS-ii-1)] = green[jj*NUM_CELLS + ii];      
+      gr_hat[(NUM_CELLS-jj-1)*NUM_CELLS + ii] = green[jj*NUM_CELLS + ii];      
+    }
+  }
+
+  // plan for fft2(rho)
+  rho_plan = fftw_plan_dft_2d(NUM_CELLS, NUM_CELLS, rho_complex, rho_hat, FFTW_FORWARD, FFTW_ESTIMATE);
+  if(!rho_plan){
+    printf("FFTW rho_plan failed.\n");
+    exit(1);
+  }
+
+  // plan for ifft2(gr_hat * rho_hat)
+  phi_plan = fftw_plan_dft_2d(NUM_CELLS, NUM_CELLS, green_rho_hat, phi_complex, FFTW_BACKWARD, FFTW_ESTIMATE);
+  if(!phi_plan){
+    printf("FFTW phi_plan failed.\n");
+    exit(1);
+  }
+
   // start timer
   clock_gettime(CLOCK_MONOTONIC, &time1);
 
   // integrate time steps
   done=0;
   tt=0;
+  steps=0;
   
 #if TIFF_ENABLE
   tiff_frame=0;
@@ -369,7 +485,7 @@ int main(int argc, char *argv[])
 
     // main simulation loop
     // ********************
-    
+
     // create kick-drift integration threads
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
@@ -402,6 +518,31 @@ int main(int argc, char *argv[])
 
     // interpolate rho field from particles
     compute_rho_field(r, rho);
+
+    // copy rho to complex array
+    for(ii=0; ii<NUM_CELLS*NUM_CELLS; ii++) {
+      rho_complex[ii][0] = (double)(4.0*M_PI*M_PI)*rho[ii];
+      rho_complex[ii][1] = 0.0;
+    }
+
+    // compute rho_hat
+    fftw_execute(rho_plan);
+
+    // multiply green's function and density in k-space
+    for(jj=0; jj<NUM_CELLS; jj++) {
+      for(ii=0; ii<NUM_CELLS; ii++) {
+	green_rho_hat[jj*NUM_CELLS + ii][0] = gr_hat[jj*NUM_CELLS + ii] * rho_hat[jj*NUM_CELLS + ii][0];
+	green_rho_hat[jj*NUM_CELLS + ii][1] = gr_hat[jj*NUM_CELLS + ii] * rho_hat[jj*NUM_CELLS + ii][1];
+      }
+    }
+    
+    // compute phi_complex
+    fftw_execute(phi_plan);
+
+    // compute real(phi_complex)
+    for(ii=0; ii<NUM_CELLS*NUM_CELLS; ii++) {
+      phi[ii] = 1.0/(NUM_CELLS) * phi_complex[ii][0];
+    }
     
     // create kick integration threads
     pthread_attr_init(&attr);
@@ -449,7 +590,9 @@ int main(int argc, char *argv[])
       for(jj=0; jj<NUM_CELLS; jj++){
 	for(ii=0; ii<NUM_CELLS; ii++){
 	  // get field value
-	  d=NUM_PARTICLES*256.0*rho[jj*NUM_CELLS+ii];
+	  //d=NUM_PARTICLES*256.0*rho[jj*NUM_CELLS+ii];
+	  //d=2.0*green_rho_hat[jj*NUM_CELLS+ii][0];
+	  d=-0.67*phi[jj*NUM_CELLS+ii];
 
 	  // clip value
 	  if(d>255.0) {
@@ -458,13 +601,16 @@ int main(int argc, char *argv[])
 	  else if(d<0.0) {
 	    d=0.0;
 	  }
+
+	  d=d/256.0;
 	  
 	  // update framebuffer
 	  for(jj2=0; jj2<SCALE; jj2++){
 	    for(ii2=0; ii2<SCALE; ii2++){
-	      pixels[3*(SCALE*jj+jj2)*screen->w+3*(SCALE*ii+ii2)+0]=(Uint8)d;
-	      pixels[3*(SCALE*jj+jj2)*screen->w+3*(SCALE*ii+ii2)+1]=(Uint8)d;
-	      pixels[3*(SCALE*jj+jj2)*screen->w+3*(SCALE*ii+ii2)+2]=(Uint8)d;
+	      colormap(d, col);
+	      pixels[3*(SCALE*jj+jj2)*screen->w+3*(SCALE*ii+ii2)+0]=(Uint8)(col->r*255.0);
+	      pixels[3*(SCALE*jj+jj2)*screen->w+3*(SCALE*ii+ii2)+1]=(Uint8)(col->g*255.0);
+	      pixels[3*(SCALE*jj+jj2)*screen->w+3*(SCALE*ii+ii2)+2]=(Uint8)(col->b*255.0);
 	    }
 	  }
 	}
@@ -495,6 +641,8 @@ int main(int argc, char *argv[])
     steps++;
   }
 
+  fftw_destroy_plan(rho_plan);
+  
 #if SDL
   // clean up SDL
   SDL_Quit();
