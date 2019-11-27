@@ -51,7 +51,7 @@
 #define NUM_CELLS 512
 
 // number of particles
-#define NUM_PARTICLES 256000
+#define NUM_PARTICLES 2*512000
 
 // minimum and maximum geometries
 #define XMIN 0
@@ -479,7 +479,7 @@ int main(int argc, char *argv[])
     }
 
     dd = vector_norm(r2, 2);
-    vv = sqrt(2.0*4.0*M_PI*M_PI*0.25*dd);
+    vv = sqrt(2.0*4.0*M_PI*M_PI*0.125*dd);
     
     v[nn*NUM_DIMS + 0] = -r2[1]*vv/dd;
     v[nn*NUM_DIMS + 1] = r2[0]*vv/dd;
@@ -650,7 +650,7 @@ int main(int argc, char *argv[])
       for(jj=0; jj<NUM_CELLS; jj++){
 	for(ii=0; ii<NUM_CELLS; ii++){
 	  // get field value
-	  d=NUM_PARTICLES*16.0*rho[jj*NUM_CELLS+ii];
+	  d=NUM_PARTICLES*4.0*rho[jj*NUM_CELLS+ii];
 	  //d=-0.2*phi[jj*NUM_CELLS+ii];
 
 	  // clip value
