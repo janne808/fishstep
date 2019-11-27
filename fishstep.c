@@ -39,7 +39,7 @@
 #include "fishstep.h"
 
 // number of posix threads
-#define NUM_THREADS 2
+#define NUM_THREADS 4
 
 // draw every Nth frame
 #define FRAMESKIP 2
@@ -51,7 +51,7 @@
 #define NUM_CELLS 512
 
 // number of particles
-#define NUM_PARTICLES 128000
+#define NUM_PARTICLES 256000
 
 // minimum and maximum geometries
 #define XMIN 0
@@ -333,7 +333,10 @@ int main(int argc, char *argv[])
   double *v;
   double *a;
 
+  // initial condition variables
   double r2[NUM_DIMS];
+  double dd;
+  double vv;
   
   double *rho;
   double *phi;
@@ -474,11 +477,12 @@ int main(int argc, char *argv[])
       r2[0] = r[nn*NUM_DIMS + 0] - NUM_CELLS/2;
       r2[1] = r[nn*NUM_DIMS + 1] - NUM_CELLS/2;
     }
+
+    dd = vector_norm(r2, 2);
+    vv = sqrt(2.0*4.0*M_PI*M_PI*0.25*dd);
     
-    //r[nn*NUM_DIMS + 0] = r2[0];
-    //r[nn*NUM_DIMS + 1] = r2[1];
-    v[nn*NUM_DIMS + 0] = 0.0;
-    v[nn*NUM_DIMS + 1] = 0.0;
+    v[nn*NUM_DIMS + 0] = -r2[1]*vv/dd;
+    v[nn*NUM_DIMS + 1] = r2[0]*vv/dd;
 
     a[nn*NUM_DIMS + 0] = 0.0;
     a[nn*NUM_DIMS + 1] = 0.0;
