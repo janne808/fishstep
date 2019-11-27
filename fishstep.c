@@ -39,19 +39,19 @@
 #include "fishstep.h"
 
 // number of posix threads
-#define NUM_THREADS 4
+#define NUM_THREADS 2
 
 // draw every Nth frame
-#define FRAMESKIP 16
+#define FRAMESKIP 2
 
 // graphics scale up factor
-#define SCALE 2
+#define SCALE 1
 
 // number of cells per dimension
-#define NUM_CELLS 256
+#define NUM_CELLS 512
 
 // number of particles
-#define NUM_PARTICLES 32
+#define NUM_PARTICLES 128000
 
 // minimum and maximum geometries
 #define XMIN 0
@@ -63,7 +63,7 @@
 // particle mass
 #define MASS (double)(1.0/(double)(NUM_PARTICLES));
 
-#define DT 0.0125;
+#define DT 0.05;
 
 #define G 4.0*M_PI*M_PI;
 
@@ -138,6 +138,18 @@ void writeframe(char* path, SDL_Surface *screen){
 }
 #endif
 
+// vector norm
+double vector_norm(double *r, int dim) {
+  int ii;
+  double s=0;
+  
+  for(ii=0; ii<dim; ii++) {
+    s += r[ii]*r[ii];
+  }
+
+  return sqrt(s);
+}
+
 // particle kick-drift thread 
 void *integration_kick_drift_thread(void *threadarg){
   // loop variables
@@ -178,17 +190,17 @@ void *integration_kick_drift_thread(void *threadarg){
     r[ii*NUM_DIMS + 1] += dt*v[ii*NUM_DIMS + 1];
 
     // enforce periodic boundaries
-    if(r[ii*NUM_DIMS + 0] > (double)(XMAX-1)) {
-      r[ii*NUM_DIMS + 0] -= (double)(XMAX-1);
+    if(r[ii*NUM_DIMS + 0] > (double)(NUM_CELLS)) {
+      r[ii*NUM_DIMS + 0] -= (double)(NUM_CELLS-1);
     }
-    else if(r[ii*NUM_DIMS + 0] < (double)(XMIN)) {
-      r[ii*NUM_DIMS + 0] += (double)(XMAX-1);
+    else if(r[ii*NUM_DIMS + 0] < (double)(1.0)) {
+      r[ii*NUM_DIMS + 0] += (double)(NUM_CELLS-1);
     }
-    if(r[ii*NUM_DIMS + 1] > (double)(XMAX-1)) {
-      r[ii*NUM_DIMS + 1] -= (double)(XMAX-1);
+    if(r[ii*NUM_DIMS + 1] > (double)(NUM_CELLS)) {
+      r[ii*NUM_DIMS + 1] -= (double)(NUM_CELLS-1);
     }
-    else if(r[ii*NUM_DIMS + 1] < (double)(XMIN)) {
-      r[ii*NUM_DIMS + 1] += (double)(XMAX-1);
+    else if(r[ii*NUM_DIMS + 1] < (double)(1.0)) {
+      r[ii*NUM_DIMS + 1] += (double)(NUM_CELLS-1);
     }
   }
 
@@ -254,14 +266,44 @@ void compute_rho_field(double *r, double *rho) {
     ii = floor(r[nn*NUM_DIMS + 0]);
     jj = floor(r[nn*NUM_DIMS + 1]);
 
-    // CIC field interpolation
-    dr[0] = r[nn*NUM_DIMS + 0] - (double)(ii);
-    dr[1] = r[nn*NUM_DIMS + 1] - (double)(jj);
+    // cloud in cell field interpolation
+    dr[0] = r[nn*NUM_DIMS + 0] - (double)(ii) - 0.5;
+    dr[1] = r[nn*NUM_DIMS + 1] - (double)(jj) - 0.5;
+    
     rho[jj*NUM_CELLS + ii] += (1.0 - dr[0])*(1.0 - dr[1])*MASS;
     rho[jj*NUM_CELLS + ((ii+1) % NUM_CELLS)] += (dr[0])*(1.0 - dr[1])*MASS;
     rho[((jj+1) % NUM_CELLS)*NUM_CELLS + ii] += (1.0 - dr[0])*(dr[1])*MASS;
     rho[((jj+1) % NUM_CELLS)*NUM_CELLS + ((ii+1) % NUM_CELLS)] += (dr[0])*(dr[1])*MASS; 
   }
+}
+
+void compute_acceleration(double *r, double *a, double *phi) {
+  int nn;
+  int ii, jj;
+
+  double dr[2];
+  double g_x, g_y;
+
+  for(nn=0; nn<NUM_PARTICLES; nn++) {
+    ii = floor(r[nn*NUM_DIMS + 0]);
+    jj = floor(r[nn*NUM_DIMS + 1]);
+    dr[0] = r[nn*NUM_DIMS + 0] - (double)(ii) - 0.5;
+    dr[1] = r[nn*NUM_DIMS + 1] - (double)(jj) - 0.5;
+
+    // calculate force grid interpolation for 2nd order differences
+    g_x = -1.0*(phi[jj*NUM_CELLS + ((ii-1)%NUM_CELLS)] - phi[jj*NUM_CELLS + ((ii+1)%NUM_CELLS)])/2.0 * (1.0 - dr[0])*(1.0 - dr[1]) -
+                  (phi[jj*NUM_CELLS + ii] - phi[jj*NUM_CELLS + ((ii+2)%NUM_CELLS)])/2.0 * (dr[0])*(1.0-dr[1]) -
+                     (phi[((jj+1)%NUM_CELLS)*NUM_CELLS + ((ii-1)%NUM_CELLS)] - phi[((jj+1)%NUM_CELLS)*NUM_CELLS + ((ii+1)%NUM_CELLS)])/2.0 * (1.0 - dr[0])*(dr[1]) -
+                        (phi[((jj+1)%NUM_CELLS)*NUM_CELLS + ii] - phi[((jj+1)%NUM_CELLS)*NUM_CELLS + ((ii+2)%NUM_CELLS)])/2.0 * (dr[0])*(dr[1]);
+
+    g_y = -1.0*(phi[((jj-1)%NUM_CELLS)*NUM_CELLS + ii] - phi[((jj+1)%NUM_CELLS)*NUM_CELLS + ii])/2.0 * (1.0 - dr[0])*(1.0 - dr[1]) -
+                  (phi[((jj-1)%NUM_CELLS)*NUM_CELLS + ((ii+1)%NUM_CELLS)] - phi[((jj+1)%NUM_CELLS)*NUM_CELLS + ((ii+1)%NUM_CELLS)])/2.0 * (dr[0])*(1.0-dr[1]) -
+                     (phi[jj*NUM_CELLS + ii] - phi[((jj+2)%NUM_CELLS)*NUM_CELLS + ii])/2.0 * (1.0 - dr[0])*(dr[1]) -
+                        (phi[jj*NUM_CELLS + ((ii+1)%NUM_CELLS)] - phi[((jj+2)%NUM_CELLS)*NUM_CELLS + ((ii+1)%NUM_CELLS)])/2.0 * (dr[0])*(dr[1]);
+    
+    a[nn*NUM_DIMS + 0] = -g_x;
+    a[nn*NUM_DIMS + 1] = -g_y;
+  }  
 }
 
 /* compute time difference in seconds and nanoseconds */
@@ -291,6 +333,8 @@ int main(int argc, char *argv[])
   double *v;
   double *a;
 
+  double r2[NUM_DIMS];
+  
   double *rho;
   double *phi;
   double *green;
@@ -340,7 +384,7 @@ int main(int argc, char *argv[])
 #endif
 
   // init pseudorandom number generator
-  srand(1234);
+  srand(time(0));
   
 #if SDL
   // open a SDL window
@@ -381,7 +425,7 @@ int main(int argc, char *argv[])
     exit(1);
   }
   // green's function
-  green=(double *)malloc((NUM_CELLS/2)*(NUM_CELLS/2)*sizeof(double));
+  green=(double *)malloc((NUM_CELLS)*(NUM_CELLS)*sizeof(double));
   if(!green){
     printf("Out of memory: green not allocated.\n");
     exit(1);
@@ -422,9 +466,19 @@ int main(int argc, char *argv[])
   for(nn=0; nn<NUM_PARTICLES; nn++) {
     r[nn*NUM_DIMS + 0] = NUM_CELLS*(double)(rand())/RAND_MAX;
     r[nn*NUM_DIMS + 1] = NUM_CELLS*(double)(rand())/RAND_MAX;
-
-    v[nn*NUM_DIMS + 0] = 1.0*(2.0*(double)(rand())/RAND_MAX-1.0);
-    v[nn*NUM_DIMS + 1] = 1.0*(2.0*(double)(rand())/RAND_MAX-1.0);
+    r2[0] = r[nn*NUM_DIMS + 0] - NUM_CELLS/2;
+    r2[1] = r[nn*NUM_DIMS + 1] - NUM_CELLS/2;
+    while(vector_norm(r2, 2) > 50.0){
+      r[nn*NUM_DIMS + 0] = NUM_CELLS*(double)(rand())/RAND_MAX;
+      r[nn*NUM_DIMS + 1] = NUM_CELLS*(double)(rand())/RAND_MAX;
+      r2[0] = r[nn*NUM_DIMS + 0] - NUM_CELLS/2;
+      r2[1] = r[nn*NUM_DIMS + 1] - NUM_CELLS/2;
+    }
+    
+    //r[nn*NUM_DIMS + 0] = r2[0];
+    //r[nn*NUM_DIMS + 1] = r2[1];
+    v[nn*NUM_DIMS + 0] = 0.0;
+    v[nn*NUM_DIMS + 1] = 0.0;
 
     a[nn*NUM_DIMS + 0] = 0.0;
     a[nn*NUM_DIMS + 1] = 0.0;
@@ -433,8 +487,8 @@ int main(int argc, char *argv[])
   // compute gravitational green's function in k-space
   for(jj=0; jj<NUM_CELLS/2; jj++) {
     for(ii=0; ii<NUM_CELLS/2; ii++) {
-      k_x = 2.0*M_PI*(ii+1)/256.0;
-      k_y = 2.0*M_PI*(jj+1)/256.0;
+      k_x = 2.0*M_PI*(ii+1)/(double)(NUM_CELLS);
+      k_y = 2.0*M_PI*(jj+1)/(double)(NUM_CELLS);
 
       green[jj*NUM_CELLS + ii] = -(1.0/4.0)*1.0/(sin(k_x/2.0)*sin(k_x/2.0)+sin(k_y/2.0)*sin(k_y/2.0));
       gr_hat[jj*NUM_CELLS + ii] = green[jj*NUM_CELLS + ii];
@@ -543,6 +597,8 @@ int main(int argc, char *argv[])
     for(ii=0; ii<NUM_CELLS*NUM_CELLS; ii++) {
       phi[ii] = 1.0/(NUM_CELLS) * phi_complex[ii][0];
     }
+
+    compute_acceleration(r, a, phi);
     
     // create kick integration threads
     pthread_attr_init(&attr);
@@ -590,9 +646,8 @@ int main(int argc, char *argv[])
       for(jj=0; jj<NUM_CELLS; jj++){
 	for(ii=0; ii<NUM_CELLS; ii++){
 	  // get field value
-	  //d=NUM_PARTICLES*256.0*rho[jj*NUM_CELLS+ii];
-	  //d=2.0*green_rho_hat[jj*NUM_CELLS+ii][0];
-	  d=-0.67*phi[jj*NUM_CELLS+ii];
+	  d=NUM_PARTICLES*16.0*rho[jj*NUM_CELLS+ii];
+	  //d=-0.2*phi[jj*NUM_CELLS+ii];
 
 	  // clip value
 	  if(d>255.0) {
@@ -602,15 +657,18 @@ int main(int argc, char *argv[])
 	    d=0.0;
 	  }
 
-	  d=d/256.0;
+	  //d=d/256.0;
 	  
 	  // update framebuffer
 	  for(jj2=0; jj2<SCALE; jj2++){
 	    for(ii2=0; ii2<SCALE; ii2++){
-	      colormap(d, col);
-	      pixels[3*(SCALE*jj+jj2)*screen->w+3*(SCALE*ii+ii2)+0]=(Uint8)(col->r*255.0);
-	      pixels[3*(SCALE*jj+jj2)*screen->w+3*(SCALE*ii+ii2)+1]=(Uint8)(col->g*255.0);
-	      pixels[3*(SCALE*jj+jj2)*screen->w+3*(SCALE*ii+ii2)+2]=(Uint8)(col->b*255.0);
+	      //colormap(d, col);
+	      //pixels[3*(SCALE*jj+jj2)*screen->w+3*(SCALE*ii+ii2)+0]=(Uint8)(col->r*255.0);
+	      //pixels[3*(SCALE*jj+jj2)*screen->w+3*(SCALE*ii+ii2)+1]=(Uint8)(col->g*255.0);
+	      //pixels[3*(SCALE*jj+jj2)*screen->w+3*(SCALE*ii+ii2)+2]=(Uint8)(col->b*255.0);
+	      pixels[3*(SCALE*jj+jj2)*screen->w+3*(SCALE*ii+ii2)+0]=(Uint8)(d);
+	      pixels[3*(SCALE*jj+jj2)*screen->w+3*(SCALE*ii+ii2)+1]=(Uint8)(d);
+	      pixels[3*(SCALE*jj+jj2)*screen->w+3*(SCALE*ii+ii2)+2]=(Uint8)(d);
 	    }
 	  }
 	}
