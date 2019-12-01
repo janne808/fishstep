@@ -51,7 +51,7 @@
 #define NUM_CELLS 512
 
 // number of particles
-#define NUM_PARTICLES 2*512000
+#define NUM_PARTICLES 512000
 
 // minimum and maximum geometries
 #define XMIN 0
@@ -61,9 +61,9 @@
 #define NUM_DIMS 2
 
 // particle mass
-#define MASS (double)(1.0/(double)(NUM_PARTICLES));
+#define MASS (double)(2.0/(double)(NUM_PARTICLES));
 
-#define DT 0.05;
+#define DT 0.0095;
 
 #define G 4.0*M_PI*M_PI;
 
@@ -190,16 +190,16 @@ void *integration_kick_drift_thread(void *threadarg){
     r[ii*NUM_DIMS + 1] += dt*v[ii*NUM_DIMS + 1];
 
     // enforce periodic boundaries
-    if(r[ii*NUM_DIMS + 0] > (double)(NUM_CELLS)) {
+    if(r[ii*NUM_DIMS + 0] > (double)(NUM_CELLS-1)) {
       r[ii*NUM_DIMS + 0] -= (double)(NUM_CELLS-1);
     }
-    else if(r[ii*NUM_DIMS + 0] < (double)(1.0)) {
+    else if(r[ii*NUM_DIMS + 0] < (double)(0)) {
       r[ii*NUM_DIMS + 0] += (double)(NUM_CELLS-1);
     }
-    if(r[ii*NUM_DIMS + 1] > (double)(NUM_CELLS)) {
+    if(r[ii*NUM_DIMS + 1] > (double)(NUM_CELLS-1)) {
       r[ii*NUM_DIMS + 1] -= (double)(NUM_CELLS-1);
     }
-    else if(r[ii*NUM_DIMS + 1] < (double)(1.0)) {
+    else if(r[ii*NUM_DIMS + 1] < (double)(0)) {
       r[ii*NUM_DIMS + 1] += (double)(NUM_CELLS-1);
     }
   }
@@ -263,12 +263,12 @@ void compute_rho_field(double *r, double *rho) {
 
   // interpolate particles into cells
   for(nn=0; nn<NUM_PARTICLES; nn++) {
-    ii = floor(r[nn*NUM_DIMS + 0]);
-    jj = floor(r[nn*NUM_DIMS + 1]);
+    ii = floor(r[nn*NUM_DIMS + 0] + 1.0);
+    jj = floor(r[nn*NUM_DIMS + 1] + 1.0);
 
     // cloud in cell field interpolation
-    dr[0] = r[nn*NUM_DIMS + 0] - (double)(ii) - 0.5;
-    dr[1] = r[nn*NUM_DIMS + 1] - (double)(jj) - 0.5;
+    dr[0] = r[nn*NUM_DIMS + 0] + 1.0 - (double)(ii);
+    dr[1] = r[nn*NUM_DIMS + 1] + 1.0 - (double)(jj);
     
     rho[jj*NUM_CELLS + ii] += (1.0 - dr[0])*(1.0 - dr[1])*MASS;
     rho[jj*NUM_CELLS + ((ii+1) % NUM_CELLS)] += (dr[0])*(1.0 - dr[1])*MASS;
@@ -285,10 +285,10 @@ void compute_acceleration(double *r, double *a, double *phi) {
   double g_x, g_y;
 
   for(nn=0; nn<NUM_PARTICLES; nn++) {
-    ii = floor(r[nn*NUM_DIMS + 0]);
-    jj = floor(r[nn*NUM_DIMS + 1]);
-    dr[0] = r[nn*NUM_DIMS + 0] - (double)(ii) - 0.5;
-    dr[1] = r[nn*NUM_DIMS + 1] - (double)(jj) - 0.5;
+    ii = floor(r[nn*NUM_DIMS + 0] + 1.0);
+    jj = floor(r[nn*NUM_DIMS + 1] + 1.0);
+    dr[0] = r[nn*NUM_DIMS + 0] + 1.0 - (double)(ii);
+    dr[1] = r[nn*NUM_DIMS + 1] + 1.0 - (double)(jj);
 
     // calculate force grid interpolation for 2nd order differences
     g_x = -1.0*(phi[jj*NUM_CELLS + ((ii-1)%NUM_CELLS)] - phi[jj*NUM_CELLS + ((ii+1)%NUM_CELLS)])/2.0 * (1.0 - dr[0])*(1.0 - dr[1]) -
@@ -471,7 +471,7 @@ int main(int argc, char *argv[])
     r[nn*NUM_DIMS + 1] = NUM_CELLS*(double)(rand())/RAND_MAX;
     r2[0] = r[nn*NUM_DIMS + 0] - NUM_CELLS/2;
     r2[1] = r[nn*NUM_DIMS + 1] - NUM_CELLS/2;
-    while(vector_norm(r2, 2) > 50.0){
+    while(vector_norm(r2, 2) > 128.0){
       r[nn*NUM_DIMS + 0] = NUM_CELLS*(double)(rand())/RAND_MAX;
       r[nn*NUM_DIMS + 1] = NUM_CELLS*(double)(rand())/RAND_MAX;
       r2[0] = r[nn*NUM_DIMS + 0] - NUM_CELLS/2;
@@ -479,15 +479,18 @@ int main(int argc, char *argv[])
     }
 
     dd = vector_norm(r2, 2);
-    vv = sqrt(2.0*4.0*M_PI*M_PI*0.125*dd);
+    vv = sqrt(2.0*4.0*M_PI*M_PI*0.0825*dd);
     
     v[nn*NUM_DIMS + 0] = -r2[1]*vv/dd;
     v[nn*NUM_DIMS + 1] = r2[0]*vv/dd;
 
+    //v[nn*NUM_DIMS + 0] = 0.0;
+    //v[nn*NUM_DIMS + 1] = 0.0;
+
     a[nn*NUM_DIMS + 0] = 0.0;
     a[nn*NUM_DIMS + 1] = 0.0;
   }
-
+  
   // compute gravitational green's function in k-space
   for(jj=0; jj<NUM_CELLS/2; jj++) {
     for(ii=0; ii<NUM_CELLS/2; ii++) {
@@ -651,7 +654,7 @@ int main(int argc, char *argv[])
 	for(ii=0; ii<NUM_CELLS; ii++){
 	  // get field value
 	  d=NUM_PARTICLES*4.0*rho[jj*NUM_CELLS+ii];
-	  //d=-0.2*phi[jj*NUM_CELLS+ii];
+	  //d=-0.04*phi[jj*NUM_CELLS+ii];
 
 	  // clip value
 	  if(d>255.0) {
@@ -666,7 +669,7 @@ int main(int argc, char *argv[])
 	  // update framebuffer
 	  for(jj2=0; jj2<SCALE; jj2++){
 	    for(ii2=0; ii2<SCALE; ii2++){
-	      //colormap(d, col);
+	      colormap(d, col);
 	      //pixels[3*(SCALE*jj+jj2)*screen->w+3*(SCALE*ii+ii2)+0]=(Uint8)(col->r*255.0);
 	      //pixels[3*(SCALE*jj+jj2)*screen->w+3*(SCALE*ii+ii2)+1]=(Uint8)(col->g*255.0);
 	      //pixels[3*(SCALE*jj+jj2)*screen->w+3*(SCALE*ii+ii2)+2]=(Uint8)(col->b*255.0);
@@ -677,7 +680,7 @@ int main(int argc, char *argv[])
 	  }
 	}
       }
-    
+
       SDL_UnlockSurface(screen);
       SDL_Flip(screen);
 #endif

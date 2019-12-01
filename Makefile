@@ -25,8 +25,7 @@ endif
 
 # compiler options
 OPTS=-Wall -pthread 
-#CFLAGS=-O$(OPTIMIZATION_LEVEL) -lm -lrt -lfftw3
-CFLAGS=-g -lm -lrt -lfftw3
+CFLAGS=-O$(OPTIMIZATION_LEVEL) -lm -lrt -lfftw3
 
 fishstep: 	$(OBJ)
 	$(CC) -o $@ $+ $(OPTS) $(CFLAGS) $(SDL_OPTS) $(TIFFLIB_OPTS)
