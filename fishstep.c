@@ -1,5 +1,5 @@
 /*
- *  (C) 2019 Janne Heikkarainen <janne808@radiofreerobotron.net>
+ *  (C) 2020 Janne Heikkarainen <janne808@radiofreerobotron.net>
  *
  *  All rights reserved.
  *
@@ -51,7 +51,7 @@
 #define NUM_CELLS 512
 
 // number of particles
-#define NUM_PARTICLES 512000
+#define NUM_PARTICLES 128000
 
 // minimum and maximum geometries
 #define XMIN 0
@@ -61,9 +61,9 @@
 #define NUM_DIMS 2
 
 // particle mass
-#define MASS (double)(2.0/(double)(NUM_PARTICLES));
+#define MASS (double)(1.0/(double)(NUM_PARTICLES));
 
-#define DT 0.0095;
+#define DT 0.0295;
 
 #define G 4.0*M_PI*M_PI;
 
@@ -190,17 +190,17 @@ void *integration_kick_drift_thread(void *threadarg){
     r[ii*NUM_DIMS + 1] += dt*v[ii*NUM_DIMS + 1];
 
     // enforce periodic boundaries
-    if(r[ii*NUM_DIMS + 0] > (double)(NUM_CELLS-1)) {
-      r[ii*NUM_DIMS + 0] -= (double)(NUM_CELLS-1);
+    if(r[ii*NUM_DIMS + 0] > (double)(NUM_CELLS)) {
+      r[ii*NUM_DIMS + 0] -= (double)(NUM_CELLS);
     }
     else if(r[ii*NUM_DIMS + 0] < (double)(0)) {
-      r[ii*NUM_DIMS + 0] += (double)(NUM_CELLS-1);
+      r[ii*NUM_DIMS + 0] += (double)(NUM_CELLS);
     }
-    if(r[ii*NUM_DIMS + 1] > (double)(NUM_CELLS-1)) {
-      r[ii*NUM_DIMS + 1] -= (double)(NUM_CELLS-1);
+    if(r[ii*NUM_DIMS + 1] > (double)(NUM_CELLS)) {
+      r[ii*NUM_DIMS + 1] -= (double)(NUM_CELLS);
     }
     else if(r[ii*NUM_DIMS + 1] < (double)(0)) {
-      r[ii*NUM_DIMS + 1] += (double)(NUM_CELLS-1);
+      r[ii*NUM_DIMS + 1] += (double)(NUM_CELLS);
     }
   }
 
@@ -217,7 +217,7 @@ void *integration_kick_thread(void *threadarg){
   int hi;
 
   // thread variables
-  double *r, *v, *a;
+  double *v, *a;
   double dt;
 
   // thread data pointer
@@ -229,7 +229,6 @@ void *integration_kick_thread(void *threadarg){
   // set up pointers
   my_data=(struct thread_data *) threadarg;
 
-  r=my_data->r;
   v=my_data->v;
   a=my_data->a;
   dt=my_data->dt;
@@ -263,17 +262,17 @@ void compute_rho_field(double *r, double *rho) {
 
   // interpolate particles into cells
   for(nn=0; nn<NUM_PARTICLES; nn++) {
-    ii = floor(r[nn*NUM_DIMS + 0] + 1.0);
-    jj = floor(r[nn*NUM_DIMS + 1] + 1.0);
+    ii = floor(r[nn*NUM_DIMS + 0]);
+    jj = floor(r[nn*NUM_DIMS + 1]);
 
     // cloud in cell field interpolation
-    dr[0] = r[nn*NUM_DIMS + 0] + 1.0 - (double)(ii);
-    dr[1] = r[nn*NUM_DIMS + 1] + 1.0 - (double)(jj);
+    dr[0] = r[nn*NUM_DIMS + 0] - (double)(ii);
+    dr[1] = r[nn*NUM_DIMS + 1] - (double)(jj);
     
     rho[jj*NUM_CELLS + ii] += (1.0 - dr[0])*(1.0 - dr[1])*MASS;
-    rho[jj*NUM_CELLS + ((ii+1) % NUM_CELLS)] += (dr[0])*(1.0 - dr[1])*MASS;
-    rho[((jj+1) % NUM_CELLS)*NUM_CELLS + ii] += (1.0 - dr[0])*(dr[1])*MASS;
-    rho[((jj+1) % NUM_CELLS)*NUM_CELLS + ((ii+1) % NUM_CELLS)] += (dr[0])*(dr[1])*MASS; 
+    rho[jj*NUM_CELLS + modulo(ii+1, NUM_CELLS)] += (dr[0])*(1.0 - dr[1])*MASS;
+    rho[modulo(jj+1, NUM_CELLS)*NUM_CELLS + ii] += (1.0 - dr[0])*(dr[1])*MASS;
+    rho[modulo(jj+1, NUM_CELLS)*NUM_CELLS + modulo(ii+1, NUM_CELLS)] += (dr[0])*(dr[1])*MASS; 
   }
 }
 
@@ -285,24 +284,27 @@ void compute_acceleration(double *r, double *a, double *phi) {
   double g_x, g_y;
 
   for(nn=0; nn<NUM_PARTICLES; nn++) {
-    ii = floor(r[nn*NUM_DIMS + 0] + 1.0);
-    jj = floor(r[nn*NUM_DIMS + 1] + 1.0);
-    dr[0] = r[nn*NUM_DIMS + 0] + 1.0 - (double)(ii);
-    dr[1] = r[nn*NUM_DIMS + 1] + 1.0 - (double)(jj);
+    // calculate grid positions
+    ii = floor(r[nn*NUM_DIMS + 0]);
+    jj = floor(r[nn*NUM_DIMS + 1]);
+    
+    // calculate offset in grid
+    dr[0] = r[nn*NUM_DIMS + 0] - (double)(ii);
+    dr[1] = r[nn*NUM_DIMS + 1] - (double)(jj);
 
     // calculate force grid interpolation for 2nd order differences
-    g_x = -1.0*(phi[jj*NUM_CELLS + ((ii-1)%NUM_CELLS)] - phi[jj*NUM_CELLS + ((ii+1)%NUM_CELLS)])/2.0 * (1.0 - dr[0])*(1.0 - dr[1]) -
-                  (phi[jj*NUM_CELLS + ii] - phi[jj*NUM_CELLS + ((ii+2)%NUM_CELLS)])/2.0 * (dr[0])*(1.0-dr[1]) -
-                     (phi[((jj+1)%NUM_CELLS)*NUM_CELLS + ((ii-1)%NUM_CELLS)] - phi[((jj+1)%NUM_CELLS)*NUM_CELLS + ((ii+1)%NUM_CELLS)])/2.0 * (1.0 - dr[0])*(dr[1]) -
-                        (phi[((jj+1)%NUM_CELLS)*NUM_CELLS + ii] - phi[((jj+1)%NUM_CELLS)*NUM_CELLS + ((ii+2)%NUM_CELLS)])/2.0 * (dr[0])*(dr[1]);
+    g_x = (phi[jj*NUM_CELLS + modulo(ii-1, NUM_CELLS)] - phi[jj*NUM_CELLS + modulo(ii+1, NUM_CELLS)])/2.0 * (1.0 - dr[0])*(1.0 - dr[1]);
+    g_x += (phi[jj*NUM_CELLS + ii] - phi[jj*NUM_CELLS + modulo(ii+2, NUM_CELLS)])/2.0 * (dr[0])*(1.0-dr[1]);
+    g_x += (phi[modulo(jj+1, NUM_CELLS)*NUM_CELLS + modulo(ii-1, NUM_CELLS)] - phi[modulo(jj+1, NUM_CELLS)*NUM_CELLS + modulo(ii+1, NUM_CELLS)])/2.0 * (1.0 - dr[0])*(dr[1]);
+    g_x += (phi[modulo(jj+1, NUM_CELLS)*NUM_CELLS + ii] - phi[modulo(jj+1, NUM_CELLS)*NUM_CELLS + modulo(ii+2, NUM_CELLS)])/2.0 * (dr[0])*(dr[1]);
 
-    g_y = -1.0*(phi[((jj-1)%NUM_CELLS)*NUM_CELLS + ii] - phi[((jj+1)%NUM_CELLS)*NUM_CELLS + ii])/2.0 * (1.0 - dr[0])*(1.0 - dr[1]) -
-                  (phi[((jj-1)%NUM_CELLS)*NUM_CELLS + ((ii+1)%NUM_CELLS)] - phi[((jj+1)%NUM_CELLS)*NUM_CELLS + ((ii+1)%NUM_CELLS)])/2.0 * (dr[0])*(1.0-dr[1]) -
-                     (phi[jj*NUM_CELLS + ii] - phi[((jj+2)%NUM_CELLS)*NUM_CELLS + ii])/2.0 * (1.0 - dr[0])*(dr[1]) -
-                        (phi[jj*NUM_CELLS + ((ii+1)%NUM_CELLS)] - phi[((jj+2)%NUM_CELLS)*NUM_CELLS + ((ii+1)%NUM_CELLS)])/2.0 * (dr[0])*(dr[1]);
+    g_y = (phi[modulo(jj-1, NUM_CELLS)*NUM_CELLS + ii] - phi[modulo(jj+1, NUM_CELLS)*NUM_CELLS + ii])/2.0 * (1.0 - dr[0])*(1.0 - dr[1]);
+    g_y += (phi[modulo(jj-1, NUM_CELLS)*NUM_CELLS + modulo(ii+1, NUM_CELLS)] - phi[modulo(jj+1, NUM_CELLS)*NUM_CELLS + modulo(ii+1, NUM_CELLS)])/2.0 * (dr[0])*(1.0-dr[1]);
+    g_y += (phi[jj*NUM_CELLS + ii] - phi[modulo(jj+2, NUM_CELLS)*NUM_CELLS + ii])/2.0 * (1.0 - dr[0])*(dr[1]);
+    g_y += (phi[jj*NUM_CELLS + modulo(ii+1, NUM_CELLS)] - phi[modulo(jj+2, NUM_CELLS)*NUM_CELLS + modulo(ii+1, NUM_CELLS)])/2.0 * (dr[0])*(dr[1]);
     
-    a[nn*NUM_DIMS + 0] = -g_x;
-    a[nn*NUM_DIMS + 1] = -g_y;
+    a[nn*NUM_DIMS + 0] = g_x;
+    a[nn*NUM_DIMS + 1] = g_y;
   }  
 }
 
@@ -469,9 +471,10 @@ int main(int argc, char *argv[])
   for(nn=0; nn<NUM_PARTICLES; nn++) {
     r[nn*NUM_DIMS + 0] = NUM_CELLS*(double)(rand())/RAND_MAX;
     r[nn*NUM_DIMS + 1] = NUM_CELLS*(double)(rand())/RAND_MAX;
+    
     r2[0] = r[nn*NUM_DIMS + 0] - NUM_CELLS/2;
     r2[1] = r[nn*NUM_DIMS + 1] - NUM_CELLS/2;
-    while(vector_norm(r2, 2) > 128.0){
+    while(vector_norm(r2, 2) > 28.0){
       r[nn*NUM_DIMS + 0] = NUM_CELLS*(double)(rand())/RAND_MAX;
       r[nn*NUM_DIMS + 1] = NUM_CELLS*(double)(rand())/RAND_MAX;
       r2[0] = r[nn*NUM_DIMS + 0] - NUM_CELLS/2;
@@ -479,7 +482,7 @@ int main(int argc, char *argv[])
     }
 
     dd = vector_norm(r2, 2);
-    vv = sqrt(2.0*4.0*M_PI*M_PI*0.0825*dd);
+    vv = sqrt(2.0*4.0*M_PI*M_PI*1.4825*dd);
     
     v[nn*NUM_DIMS + 0] = -r2[1]*vv/dd;
     v[nn*NUM_DIMS + 1] = r2[0]*vv/dd;
@@ -654,7 +657,7 @@ int main(int argc, char *argv[])
 	for(ii=0; ii<NUM_CELLS; ii++){
 	  // get field value
 	  d=NUM_PARTICLES*4.0*rho[jj*NUM_CELLS+ii];
-	  //d=-0.04*phi[jj*NUM_CELLS+ii];
+	  //d=-0.1*phi[jj*NUM_CELLS+ii];
 
 	  // clip value
 	  if(d>255.0) {
@@ -669,10 +672,13 @@ int main(int argc, char *argv[])
 	  // update framebuffer
 	  for(jj2=0; jj2<SCALE; jj2++){
 	    for(ii2=0; ii2<SCALE; ii2++){
-	      colormap(d, col);
+	      // display heatmap style field
+	      //colormap(d, col);
 	      //pixels[3*(SCALE*jj+jj2)*screen->w+3*(SCALE*ii+ii2)+0]=(Uint8)(col->r*255.0);
 	      //pixels[3*(SCALE*jj+jj2)*screen->w+3*(SCALE*ii+ii2)+1]=(Uint8)(col->g*255.0);
 	      //pixels[3*(SCALE*jj+jj2)*screen->w+3*(SCALE*ii+ii2)+2]=(Uint8)(col->b*255.0);
+
+	      // display density of particles
 	      pixels[3*(SCALE*jj+jj2)*screen->w+3*(SCALE*ii+ii2)+0]=(Uint8)(d);
 	      pixels[3*(SCALE*jj+jj2)*screen->w+3*(SCALE*ii+ii2)+1]=(Uint8)(d);
 	      pixels[3*(SCALE*jj+jj2)*screen->w+3*(SCALE*ii+ii2)+2]=(Uint8)(d);

@@ -1,5 +1,5 @@
 /*
- *  (C) 2019 Janne Heikkarainen <janne808@radiofreerobotron.net>
+ *  (C) 2020 Janne Heikkarainen <janne808@radiofreerobotron.net>
  *
  *  All rights reserved.
  *
@@ -31,5 +31,10 @@ struct thread_data{
   
   double dt;
 };
+
+// custom modulo function to patch C style % operator
+inline int modulo(int x, int mod){
+  return ((x % mod) + mod) % mod;
+}
 
 #endif
