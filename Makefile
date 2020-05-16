@@ -2,6 +2,7 @@
 SDL=1
 TIFF_ENABLE=0
 OPTIMIZATION_LEVEL=3
+FFTW3_THREADS=1
 
 # object files
 OBJ=fishstep.o
@@ -23,15 +24,22 @@ else
 	TIFFLIB_OPTS=
 endif
 
+# FFTW3 options
+ifeq ($(FFTW3_THREADS),1)
+	FFTW3_OPTS=-DFFTW3_THREADS=1 -lfftw3_threads
+else
+	FFTW3_OPTS=
+endif
+
 # compiler options
-OPTS=-Wall -pthread 
+OPTS=-Wall -pthread
 CFLAGS=-O$(OPTIMIZATION_LEVEL) -lm -lrt -lfftw3
 
 fishstep: 	$(OBJ)
-	$(CC) -o $@ $+ $(OPTS) $(CFLAGS) $(SDL_OPTS) $(TIFFLIB_OPTS)
+	$(CC) -o $@ $+ $(OPTS) $(CFLAGS) $(SDL_OPTS) $(TIFFLIB_OPTS) $(FFTW3_OPTS)
 
 fishstep.o:	fishstep.c
-	$(CC) $(OPTS) $(CFLAGS) $(SDL_OPTS) $(TIFFLIB_OPTS) -c $<
+	$(CC) $(OPTS) $(CFLAGS) $(SDL_OPTS) $(TIFFLIB_OPTS) $(FFTW3_OPTS) -c $<
 
 .PHONY: clean
 clean:

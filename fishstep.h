@@ -28,13 +28,33 @@ struct thread_data{
   double *r;
   double *v;
   double *a;
+
+  double *phi;
+  double *rho;
   
   double dt;
 };
 
+// vector norm
+inline double vector_norm(double *r, int dim) {
+  int ii;
+  double s=0;
+  
+  for(ii=0; ii<dim; ii++) {
+    s += r[ii]*r[ii];
+  }
+
+  return sqrt(s);
+}
+
 // custom modulo function to patch C style % operator
 inline int modulo(int x, int mod){
-  return ((x % mod) + mod) % mod;
+  if(x >= 0 && x < mod){
+    return x;
+  }
+  else{
+    return ((x % mod) + mod) % mod;
+  }
 }
 
 #endif

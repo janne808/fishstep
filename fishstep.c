@@ -42,7 +42,7 @@
 #define NUM_THREADS 4
 
 // draw every Nth frame
-#define FRAMESKIP 2
+#define FRAMESKIP 16
 
 // graphics scale up factor
 #define SCALE 1
@@ -51,7 +51,7 @@
 #define NUM_CELLS 512
 
 // number of particles
-#define NUM_PARTICLES 128000
+#define NUM_PARTICLES 5*512000
 
 // minimum and maximum geometries
 #define XMIN 0
@@ -63,7 +63,7 @@
 // particle mass
 #define MASS (double)(1.0/(double)(NUM_PARTICLES));
 
-#define DT 0.0295;
+#define DT 0.0095;
 
 #define G 4.0*M_PI*M_PI;
 
@@ -137,18 +137,6 @@ void writeframe(char* path, SDL_Surface *screen){
   }
 }
 #endif
-
-// vector norm
-double vector_norm(double *r, int dim) {
-  int ii;
-  double s=0;
-  
-  for(ii=0; ii<dim; ii++) {
-    s += r[ii]*r[ii];
-  }
-
-  return sqrt(s);
-}
 
 // particle kick-drift thread 
 void *integration_kick_drift_thread(void *threadarg){
@@ -247,6 +235,89 @@ void *integration_kick_thread(void *threadarg){
   pthread_exit(NULL);
 }
 
+void *zero_rho_field_thread(void *threadarg){
+  // loop variables
+  int nn;
+
+  // thread slice boundaries
+  int lo;
+  int hi;
+
+  // thread variables
+  double *rho;
+  
+  // thread data pointer
+  struct thread_data *my_data;
+
+  // thread enumeration variable
+  int thread_id;
+
+  // set up pointers
+  my_data=(struct thread_data *) threadarg;
+
+  rho=my_data->rho;
+
+  thread_id=my_data->thread_id;
+
+  // compute thread slice
+  lo=thread_id*(NUM_CELLS*NUM_CELLS)/NUM_THREADS;
+  hi=(thread_id+1)*(NUM_CELLS*NUM_CELLS)/NUM_THREADS;
+
+  for(nn=lo; nn<hi; nn++) {
+    rho[nn] = 0.0;
+  }
+
+  pthread_exit(NULL);
+}
+
+void *compute_rho_field_thread(void *threadarg){
+  // loop variables
+  int nn;
+
+  // thread slice boundaries
+  int lo;
+  int hi;
+
+  // thread variables
+  int ii,jj;
+  double *r, *rho;
+  double dr[2];
+  
+  // thread data pointer
+  struct thread_data *my_data;
+
+  // thread enumeration variable
+  int thread_id;
+
+  // set up pointers
+  my_data=(struct thread_data *) threadarg;
+
+  r=my_data->r;
+  rho=my_data->rho;
+
+  thread_id=my_data->thread_id;
+
+  // compute thread slice
+  lo=thread_id*NUM_PARTICLES/NUM_THREADS;
+  hi=(thread_id+1)*NUM_PARTICLES/NUM_THREADS;
+
+  for(nn=lo; nn<hi; nn++) {
+    ii = floor(r[nn*NUM_DIMS + 0]);
+    jj = floor(r[nn*NUM_DIMS + 1]);
+
+    // cloud in cell field interpolation
+    dr[0] = r[nn*NUM_DIMS + 0] - (double)(ii);
+    dr[1] = r[nn*NUM_DIMS + 1] - (double)(jj);
+    
+    rho[jj*NUM_CELLS + ii] += (1.0 - dr[0])*(1.0 - dr[1])*MASS;
+    rho[jj*NUM_CELLS + modulo(ii+1, NUM_CELLS)] += (dr[0])*(1.0 - dr[1])*MASS;
+    rho[modulo(jj+1, NUM_CELLS)*NUM_CELLS + ii] += (1.0 - dr[0])*(dr[1])*MASS;
+    rho[modulo(jj+1, NUM_CELLS)*NUM_CELLS + modulo(ii+1, NUM_CELLS)] += (dr[0])*(dr[1])*MASS; 
+  }
+
+  pthread_exit(NULL);
+}
+
 void compute_rho_field(double *r, double *rho) {
   // loop variables
   int nn;
@@ -274,6 +345,67 @@ void compute_rho_field(double *r, double *rho) {
     rho[modulo(jj+1, NUM_CELLS)*NUM_CELLS + ii] += (1.0 - dr[0])*(dr[1])*MASS;
     rho[modulo(jj+1, NUM_CELLS)*NUM_CELLS + modulo(ii+1, NUM_CELLS)] += (dr[0])*(dr[1])*MASS; 
   }
+}
+
+void *acceleration_interpolation_thread(void *threadarg){
+  // loop variables
+  int nn;
+
+  // thread slice boundaries
+  int lo;
+  int hi;
+
+  // thread variables
+  int ii,jj;
+  double *r, *a, *phi;
+  
+  double dr[2];
+  double g_x, g_y;
+
+  // thread data pointer
+  struct thread_data *my_data;
+
+  // thread enumeration variable
+  int thread_id;
+
+  // set up pointers
+  my_data=(struct thread_data *) threadarg;
+
+  r=my_data->r;
+  a=my_data->a;
+  phi=my_data->phi;
+
+  thread_id=my_data->thread_id;
+
+  // compute thread slice
+  lo=thread_id*NUM_PARTICLES/NUM_THREADS;
+  hi=(thread_id+1)*NUM_PARTICLES/NUM_THREADS;
+
+  for(nn=lo; nn<hi; nn++) {
+    // calculate grid positions
+    ii = floor(r[nn*NUM_DIMS + 0]);
+    jj = floor(r[nn*NUM_DIMS + 1]);
+    
+    // calculate offset in grid
+    dr[0] = r[nn*NUM_DIMS + 0] - (double)(ii);
+    dr[1] = r[nn*NUM_DIMS + 1] - (double)(jj);
+
+    // calculate force grid interpolation for 2nd order differences
+    g_x = (phi[jj*NUM_CELLS + modulo(ii-1, NUM_CELLS)] - phi[jj*NUM_CELLS + modulo(ii+1, NUM_CELLS)])/2.0 * (1.0 - dr[0])*(1.0 - dr[1]);
+    g_x += (phi[jj*NUM_CELLS + ii] - phi[jj*NUM_CELLS + modulo(ii+2, NUM_CELLS)])/2.0 * (dr[0])*(1.0-dr[1]);
+    g_x += (phi[modulo(jj+1, NUM_CELLS)*NUM_CELLS + modulo(ii-1, NUM_CELLS)] - phi[modulo(jj+1, NUM_CELLS)*NUM_CELLS + modulo(ii+1, NUM_CELLS)])/2.0 * (1.0 - dr[0])*(dr[1]);
+    g_x += (phi[modulo(jj+1, NUM_CELLS)*NUM_CELLS + ii] - phi[modulo(jj+1, NUM_CELLS)*NUM_CELLS + modulo(ii+2, NUM_CELLS)])/2.0 * (dr[0])*(dr[1]);
+
+    g_y = (phi[modulo(jj-1, NUM_CELLS)*NUM_CELLS + ii] - phi[modulo(jj+1, NUM_CELLS)*NUM_CELLS + ii])/2.0 * (1.0 - dr[0])*(1.0 - dr[1]);
+    g_y += (phi[modulo(jj-1, NUM_CELLS)*NUM_CELLS + modulo(ii+1, NUM_CELLS)] - phi[modulo(jj+1, NUM_CELLS)*NUM_CELLS + modulo(ii+1, NUM_CELLS)])/2.0 * (dr[0])*(1.0-dr[1]);
+    g_y += (phi[jj*NUM_CELLS + ii] - phi[modulo(jj+2, NUM_CELLS)*NUM_CELLS + ii])/2.0 * (1.0 - dr[0])*(dr[1]);
+    g_y += (phi[jj*NUM_CELLS + modulo(ii+1, NUM_CELLS)] - phi[modulo(jj+2, NUM_CELLS)*NUM_CELLS + modulo(ii+1, NUM_CELLS)])/2.0 * (dr[0])*(dr[1]);
+    
+    a[nn*NUM_DIMS + 0] = g_x;
+    a[nn*NUM_DIMS + 1] = g_y;
+  }
+
+  pthread_exit(NULL);
 }
 
 void compute_acceleration(double *r, double *a, double *phi) {
@@ -508,6 +640,16 @@ int main(int argc, char *argv[])
     }
   }
 
+#if FFTW3_THREADS  
+  // initialize FFTW threads
+  if(!fftw_init_threads()){
+    printf("FFTW threads failed.\n");
+    exit(1);
+  }
+
+  fftw_plan_with_nthreads(NUM_THREADS);
+#endif
+  
   // plan for fft2(rho)
   rho_plan = fftw_plan_dft_2d(NUM_CELLS, NUM_CELLS, rho_complex, rho_hat, FFTW_FORWARD, FFTW_ESTIMATE);
   if(!rho_plan){
@@ -580,9 +722,61 @@ int main(int argc, char *argv[])
       }
     }
 
-    // interpolate rho field from particles
-    compute_rho_field(r, rho);
+    // create zero rho field threads
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
 
+    for(nn=0;nn<NUM_THREADS;nn++){
+      thread_data_array[nn].thread_id=nn;
+      thread_data_array[nn].rho=rho;
+
+      thread_rc=pthread_create(&threads[nn], &attr, zero_rho_field_thread, (void *) &thread_data_array[nn]);
+    
+      if(thread_rc){
+	printf("ERROR: pthread_create() returned %d.\n", thread_rc);
+	exit(-1);
+      }
+    }
+  
+    /* join threads */
+    pthread_attr_destroy(&attr);
+    for(nn=0; nn < NUM_THREADS; nn++){
+      thread_rc=pthread_join(threads[nn], &thread_status);
+      
+      if(thread_rc){
+	printf("ERROR: pthread_join() returned %d.\n", thread_rc);
+	exit(-1);
+      }
+    }
+
+    // create rho field interpolation calculation threads
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+
+    for(nn=0;nn<NUM_THREADS;nn++){
+      thread_data_array[nn].thread_id=nn;
+      thread_data_array[nn].r=r;
+      thread_data_array[nn].rho=rho;
+
+      thread_rc=pthread_create(&threads[nn], &attr, compute_rho_field_thread, (void *) &thread_data_array[nn]);
+    
+      if(thread_rc){
+	printf("ERROR: pthread_create() returned %d.\n", thread_rc);
+	exit(-1);
+      }
+    }
+  
+    /* join threads */
+    pthread_attr_destroy(&attr);
+    for(nn=0;nn<NUM_THREADS;nn++){
+      thread_rc=pthread_join(threads[nn], &thread_status);
+      
+      if(thread_rc){
+	printf("ERROR: pthread_join() returned %d.\n", thread_rc);
+	exit(-1);
+      }
+    }
+    
     // copy rho to complex array
     for(ii=0; ii<NUM_CELLS*NUM_CELLS; ii++) {
       rho_complex[ii][0] = (double)(4.0*M_PI*M_PI)*rho[ii];
@@ -608,7 +802,35 @@ int main(int argc, char *argv[])
       phi[ii] = 1.0/(NUM_CELLS) * phi_complex[ii][0];
     }
 
-    compute_acceleration(r, a, phi);
+    // create acceleration interpolation threads
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+
+    for(nn=0;nn<NUM_THREADS;nn++){
+      thread_data_array[nn].thread_id=nn;
+      thread_data_array[nn].r=r;
+      thread_data_array[nn].a=a;
+      thread_data_array[nn].phi=phi;
+      thread_data_array[nn].dt=dt;
+
+      thread_rc=pthread_create(&threads[nn], &attr, acceleration_interpolation_thread, (void *) &thread_data_array[nn]);
+    
+      if(thread_rc){
+	printf("ERROR: pthread_create() returned %d.\n", thread_rc);
+	exit(-1);
+      }
+    }
+  
+    /* join threads */
+    pthread_attr_destroy(&attr);
+    for(nn=0;nn<NUM_THREADS;nn++){
+      thread_rc=pthread_join(threads[nn], &thread_status);
+      
+      if(thread_rc){
+	printf("ERROR: pthread_join() returned %d.\n", thread_rc);
+	exit(-1);
+      }
+    }
     
     // create kick integration threads
     pthread_attr_init(&attr);
@@ -712,7 +934,11 @@ int main(int argc, char *argv[])
     steps++;
   }
 
+  // clean up FFTW
   fftw_destroy_plan(rho_plan);
+#if FFTW3_THREADS  
+  fftw_cleanup_threads();
+#endif
   
 #if SDL
   // clean up SDL
