@@ -42,7 +42,7 @@
 #define NUM_THREADS 4
 
 // draw every Nth frame
-#define FRAMESKIP 16
+#define FRAMESKIP 2
 
 // graphics scale up factor
 #define SCALE 1
@@ -244,6 +244,42 @@ void *zero_rho_field_thread(void *threadarg){
   int hi;
 
   // thread variables
+  double *sub_rho;
+  
+  // thread data pointer
+  struct thread_data *my_data;
+
+  // thread enumeration variable
+  int thread_id;
+
+  // set up pointers
+  my_data=(struct thread_data *) threadarg;
+
+  sub_rho=my_data->rho;
+
+  thread_id=my_data->thread_id;
+
+  // compute thread slice
+  lo=thread_id*(NUM_THREADS*NUM_CELLS*NUM_CELLS)/NUM_THREADS;
+  hi=(thread_id+1)*(NUM_THREADS*NUM_CELLS*NUM_CELLS)/NUM_THREADS;
+
+  for(nn=lo; nn<hi; nn++) {
+    sub_rho[nn] = 0.0;
+  }
+
+  pthread_exit(NULL);
+}
+
+void *copy_rho_to_complex_thread(void *threadarg){
+  // loop variables
+  int nn;
+
+  // thread slice boundaries
+  int lo;
+  int hi;
+
+  // thread variables
+  fftw_complex *rho_complex;
   double *rho;
   
   // thread data pointer
@@ -256,6 +292,7 @@ void *zero_rho_field_thread(void *threadarg){
   my_data=(struct thread_data *) threadarg;
 
   rho=my_data->rho;
+  rho_complex=my_data->rho_complex;
 
   thread_id=my_data->thread_id;
 
@@ -264,7 +301,8 @@ void *zero_rho_field_thread(void *threadarg){
   hi=(thread_id+1)*(NUM_CELLS*NUM_CELLS)/NUM_THREADS;
 
   for(nn=lo; nn<hi; nn++) {
-    rho[nn] = 0.0;
+    rho_complex[nn][0] = (double)(4.0*M_PI*M_PI)*rho[nn];
+    rho_complex[nn][1] = 0.0;
   }
 
   pthread_exit(NULL);
@@ -472,13 +510,13 @@ int main(int argc, char *argv[])
   double dd;
   double vv;
   
-  double *rho;
+  double *rho, *sub_rho;
   double *phi;
   double *green;
   double *gr_hat;
 
   double k_x, k_y;
-
+  
   fftw_complex *rho_hat, *green_rho_hat, *rho_complex, *phi_complex;
   fftw_plan rho_plan, phi_plan;
   
@@ -553,6 +591,11 @@ int main(int argc, char *argv[])
   rho=(double *)malloc(NUM_CELLS*NUM_CELLS*sizeof(double));
   if(!rho){
     printf("Out of memory: rho not allocated.\n");
+    exit(1);
+  }
+  sub_rho=(double *)malloc(NUM_THREADS*NUM_CELLS*NUM_CELLS*sizeof(double));
+  if(!sub_rho){
+    printf("Out of memory: sub_rho not allocated.\n");
     exit(1);
   }
   // potential
@@ -722,13 +765,13 @@ int main(int argc, char *argv[])
       }
     }
 
-    // create zero rho field threads
+    // create zero thread rho field threads
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
 
     for(nn=0;nn<NUM_THREADS;nn++){
       thread_data_array[nn].thread_id=nn;
-      thread_data_array[nn].rho=rho;
+      thread_data_array[nn].rho=sub_rho;
 
       thread_rc=pthread_create(&threads[nn], &attr, zero_rho_field_thread, (void *) &thread_data_array[nn]);
     
@@ -756,7 +799,7 @@ int main(int argc, char *argv[])
     for(nn=0;nn<NUM_THREADS;nn++){
       thread_data_array[nn].thread_id=nn;
       thread_data_array[nn].r=r;
-      thread_data_array[nn].rho=rho;
+      thread_data_array[nn].rho=&sub_rho[nn*NUM_CELLS*NUM_CELLS];
 
       thread_rc=pthread_create(&threads[nn], &attr, compute_rho_field_thread, (void *) &thread_data_array[nn]);
     
@@ -777,12 +820,42 @@ int main(int argc, char *argv[])
       }
     }
     
-    // copy rho to complex array
-    for(ii=0; ii<NUM_CELLS*NUM_CELLS; ii++) {
-      rho_complex[ii][0] = (double)(4.0*M_PI*M_PI)*rho[ii];
-      rho_complex[ii][1] = 0.0;
+    // sum sub_rho fields into rho
+    for(ii=0;ii<NUM_CELLS*NUM_CELLS;ii++){
+      rho[ii] = 0.0;
+      for(nn=0;nn<NUM_THREADS;nn++){
+	rho[ii] += sub_rho[nn*NUM_CELLS*NUM_CELLS + ii];
+      }
     }
 
+    // create rho to complex copy threads
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+
+    for(nn=0;nn<NUM_THREADS;nn++){
+      thread_data_array[nn].thread_id=nn;
+      thread_data_array[nn].rho=rho;
+      thread_data_array[nn].rho_complex=rho_complex;
+
+      thread_rc=pthread_create(&threads[nn], &attr, copy_rho_to_complex_thread, (void *) &thread_data_array[nn]);
+    
+      if(thread_rc){
+	printf("ERROR: pthread_create() returned %d.\n", thread_rc);
+	exit(-1);
+      }
+    }
+  
+    /* join threads */
+    pthread_attr_destroy(&attr);
+    for(nn=0;nn<NUM_THREADS;nn++){
+      thread_rc=pthread_join(threads[nn], &thread_status);
+      
+      if(thread_rc){
+	printf("ERROR: pthread_join() returned %d.\n", thread_rc);
+	exit(-1);
+      }
+    }
+    
     // compute rho_hat
     fftw_execute(rho_plan);
 

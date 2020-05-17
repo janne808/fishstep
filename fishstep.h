@@ -31,6 +31,7 @@ struct thread_data{
 
   double *phi;
   double *rho;
+  fftw_complex *rho_complex;
   
   double dt;
 };
