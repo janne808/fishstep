@@ -50,8 +50,16 @@
 // number of cells per dimension
 #define NUM_CELLS 512
 
-// number of particles
-#define NUM_PARTICLES 5*512000
+// number of particles per species
+#define NUM_DM_PARTICLES (4*512000)
+#define NUM_GAS_PARTICLES (1*512000)
+#define NUM_PARTICLES (NUM_DM_PARTICLES + NUM_GAS_PARTICLES)
+
+// gas fraction of the total mass, total mass is normalized to 1
+#define GAS_MASS_FRACTION 0.16
+
+// display both species in separate color channels instead of total density
+#define DISPLAY_SPECIES 1
 
 // minimum and maximum geometries
 #define XMIN 0
@@ -60,14 +68,24 @@
 // number of dimensions
 #define NUM_DIMS 2
 
-// particle mass
-#define MASS (double)(1.0/(double)(NUM_PARTICLES));
+// particle mass per species
+#define DM_MASS ((1.0 - GAS_MASS_FRACTION)/(double)(NUM_DM_PARTICLES))
+#define GAS_MASS (GAS_MASS_FRACTION/(double)(NUM_GAS_PARTICLES))
+
+// size of the per-species, per-thread rho subfield buffer
+#define SUB_RHO_SIZE (NUM_SPECIES*NUM_THREADS*NUM_CELLS*NUM_CELLS)
 
 #define DT 0.0095;
 
 #define G 4.0*M_PI*M_PI;
 
 struct thread_data thread_data_array[NUM_THREADS];
+
+// species table, dark matter first, gas after it
+struct species_info species[NUM_SPECIES] = {
+  [SPECIES_DM]  = {0, NUM_DM_PARTICLES, DM_MASS},
+  [SPECIES_GAS] = {NUM_DM_PARTICLES, NUM_GAS_PARTICLES, GAS_MASS},
+};
 
 /* structure for RGB color */
 struct color{
@@ -260,8 +278,8 @@ void *zero_rho_field_thread(void *threadarg){
   thread_id=my_data->thread_id;
 
   // compute thread slice
-  lo=thread_id*(NUM_THREADS*NUM_CELLS*NUM_CELLS)/NUM_THREADS;
-  hi=(thread_id+1)*(NUM_THREADS*NUM_CELLS*NUM_CELLS)/NUM_THREADS;
+  lo=thread_id*(SUB_RHO_SIZE/NUM_THREADS);
+  hi=(thread_id+1)*(SUB_RHO_SIZE/NUM_THREADS);
 
   for(nn=lo; nn<hi; nn++) {
     sub_rho[nn] = 0.0;
@@ -318,9 +336,11 @@ void *compute_rho_field_thread(void *threadarg){
 
   // thread variables
   int ii,jj;
-  double *r, *rho;
+  int s;
+  double *r, *sub_rho, *rho;
   double dr[2];
-  
+  double mass;
+
   // thread data pointer
   struct thread_data *my_data;
 
@@ -331,58 +351,34 @@ void *compute_rho_field_thread(void *threadarg){
   my_data=(struct thread_data *) threadarg;
 
   r=my_data->r;
-  rho=my_data->rho;
+  sub_rho=my_data->rho;
 
   thread_id=my_data->thread_id;
 
-  // compute thread slice
-  lo=thread_id*NUM_PARTICLES/NUM_THREADS;
-  hi=(thread_id+1)*NUM_PARTICLES/NUM_THREADS;
+  // deposit each species into its own per-thread subfield
+  for(s=0; s<NUM_SPECIES; s++) {
+    rho=&sub_rho[(s*NUM_THREADS + thread_id)*NUM_CELLS*NUM_CELLS];
+    mass=species[s].mass;
 
-  for(nn=lo; nn<hi; nn++) {
-    ii = floor(r[nn*NUM_DIMS + 0]);
-    jj = floor(r[nn*NUM_DIMS + 1]);
+    // compute thread slice of this species
+    thread_slice(species[s].offset, species[s].count, thread_id, NUM_THREADS, &lo, &hi);
 
-    // cloud in cell field interpolation
-    dr[0] = r[nn*NUM_DIMS + 0] - (double)(ii);
-    dr[1] = r[nn*NUM_DIMS + 1] - (double)(jj);
-    
-    rho[jj*NUM_CELLS + ii] += (1.0 - dr[0])*(1.0 - dr[1])*MASS;
-    rho[jj*NUM_CELLS + modulo(ii+1, NUM_CELLS)] += (dr[0])*(1.0 - dr[1])*MASS;
-    rho[modulo(jj+1, NUM_CELLS)*NUM_CELLS + ii] += (1.0 - dr[0])*(dr[1])*MASS;
-    rho[modulo(jj+1, NUM_CELLS)*NUM_CELLS + modulo(ii+1, NUM_CELLS)] += (dr[0])*(dr[1])*MASS; 
+    for(nn=lo; nn<hi; nn++) {
+      ii = floor(r[nn*NUM_DIMS + 0]);
+      jj = floor(r[nn*NUM_DIMS + 1]);
+
+      // cloud in cell field interpolation
+      dr[0] = r[nn*NUM_DIMS + 0] - (double)(ii);
+      dr[1] = r[nn*NUM_DIMS + 1] - (double)(jj);
+
+      rho[jj*NUM_CELLS + ii] += (1.0 - dr[0])*(1.0 - dr[1])*mass;
+      rho[jj*NUM_CELLS + modulo(ii+1, NUM_CELLS)] += (dr[0])*(1.0 - dr[1])*mass;
+      rho[modulo(jj+1, NUM_CELLS)*NUM_CELLS + ii] += (1.0 - dr[0])*(dr[1])*mass;
+      rho[modulo(jj+1, NUM_CELLS)*NUM_CELLS + modulo(ii+1, NUM_CELLS)] += (dr[0])*(dr[1])*mass;
+    }
   }
 
   pthread_exit(NULL);
-}
-
-void compute_rho_field(double *r, double *rho) {
-  // loop variables
-  int nn;
-  int ii, jj;
-
-  // interpolation variables
-  double dr[2];
-  
-  // zero rho field
-  for(nn=0; nn<NUM_CELLS*NUM_CELLS; nn++) {
-    rho[nn] = 0.0;
-  }
-
-  // interpolate particles into cells
-  for(nn=0; nn<NUM_PARTICLES; nn++) {
-    ii = floor(r[nn*NUM_DIMS + 0]);
-    jj = floor(r[nn*NUM_DIMS + 1]);
-
-    // cloud in cell field interpolation
-    dr[0] = r[nn*NUM_DIMS + 0] - (double)(ii);
-    dr[1] = r[nn*NUM_DIMS + 1] - (double)(jj);
-    
-    rho[jj*NUM_CELLS + ii] += (1.0 - dr[0])*(1.0 - dr[1])*MASS;
-    rho[jj*NUM_CELLS + modulo(ii+1, NUM_CELLS)] += (dr[0])*(1.0 - dr[1])*MASS;
-    rho[modulo(jj+1, NUM_CELLS)*NUM_CELLS + ii] += (1.0 - dr[0])*(dr[1])*MASS;
-    rho[modulo(jj+1, NUM_CELLS)*NUM_CELLS + modulo(ii+1, NUM_CELLS)] += (dr[0])*(dr[1])*MASS; 
-  }
 }
 
 void *acceleration_interpolation_thread(void *threadarg){
@@ -446,38 +442,6 @@ void *acceleration_interpolation_thread(void *threadarg){
   pthread_exit(NULL);
 }
 
-void compute_acceleration(double *r, double *a, double *phi) {
-  int nn;
-  int ii, jj;
-
-  double dr[2];
-  double g_x, g_y;
-
-  for(nn=0; nn<NUM_PARTICLES; nn++) {
-    // calculate grid positions
-    ii = floor(r[nn*NUM_DIMS + 0]);
-    jj = floor(r[nn*NUM_DIMS + 1]);
-    
-    // calculate offset in grid
-    dr[0] = r[nn*NUM_DIMS + 0] - (double)(ii);
-    dr[1] = r[nn*NUM_DIMS + 1] - (double)(jj);
-
-    // calculate force grid interpolation for 2nd order differences
-    g_x = (phi[jj*NUM_CELLS + modulo(ii-1, NUM_CELLS)] - phi[jj*NUM_CELLS + modulo(ii+1, NUM_CELLS)])/2.0 * (1.0 - dr[0])*(1.0 - dr[1]);
-    g_x += (phi[jj*NUM_CELLS + ii] - phi[jj*NUM_CELLS + modulo(ii+2, NUM_CELLS)])/2.0 * (dr[0])*(1.0-dr[1]);
-    g_x += (phi[modulo(jj+1, NUM_CELLS)*NUM_CELLS + modulo(ii-1, NUM_CELLS)] - phi[modulo(jj+1, NUM_CELLS)*NUM_CELLS + modulo(ii+1, NUM_CELLS)])/2.0 * (1.0 - dr[0])*(dr[1]);
-    g_x += (phi[modulo(jj+1, NUM_CELLS)*NUM_CELLS + ii] - phi[modulo(jj+1, NUM_CELLS)*NUM_CELLS + modulo(ii+2, NUM_CELLS)])/2.0 * (dr[0])*(dr[1]);
-
-    g_y = (phi[modulo(jj-1, NUM_CELLS)*NUM_CELLS + ii] - phi[modulo(jj+1, NUM_CELLS)*NUM_CELLS + ii])/2.0 * (1.0 - dr[0])*(1.0 - dr[1]);
-    g_y += (phi[modulo(jj-1, NUM_CELLS)*NUM_CELLS + modulo(ii+1, NUM_CELLS)] - phi[modulo(jj+1, NUM_CELLS)*NUM_CELLS + modulo(ii+1, NUM_CELLS)])/2.0 * (dr[0])*(1.0-dr[1]);
-    g_y += (phi[jj*NUM_CELLS + ii] - phi[modulo(jj+2, NUM_CELLS)*NUM_CELLS + ii])/2.0 * (1.0 - dr[0])*(dr[1]);
-    g_y += (phi[jj*NUM_CELLS + modulo(ii+1, NUM_CELLS)] - phi[modulo(jj+2, NUM_CELLS)*NUM_CELLS + modulo(ii+1, NUM_CELLS)])/2.0 * (dr[0])*(dr[1]);
-    
-    a[nn*NUM_DIMS + 0] = g_x;
-    a[nn*NUM_DIMS + 1] = g_y;
-  }  
-}
-
 /* compute time difference in seconds and nanoseconds */
 void timediff(struct timespec start, struct timespec end, struct timespec *out){
   /* compute time difference */
@@ -510,7 +474,9 @@ int main(int argc, char *argv[])
   double dd;
   double vv;
   
-  double *rho, *sub_rho;
+  double *rho, *sub_rho, *rho_species;
+  double acc;
+  int s;
   double *phi;
   double *green;
   double *gr_hat;
@@ -537,6 +503,10 @@ int main(int argc, char *argv[])
 
   // gfx variables
   double d;
+#if DISPLAY_SPECIES
+  double d_dm, d_gas;
+  double display_scale[NUM_SPECIES];
+#endif
 #endif
 
   // program state flag
@@ -593,9 +563,15 @@ int main(int argc, char *argv[])
     printf("Out of memory: rho not allocated.\n");
     exit(1);
   }
-  sub_rho=(double *)malloc(NUM_THREADS*NUM_CELLS*NUM_CELLS*sizeof(double));
+  sub_rho=(double *)malloc(SUB_RHO_SIZE*sizeof(double));
   if(!sub_rho){
     printf("Out of memory: sub_rho not allocated.\n");
+    exit(1);
+  }
+  // density per species
+  rho_species=(double *)malloc(NUM_SPECIES*NUM_CELLS*NUM_CELLS*sizeof(double));
+  if(!rho_species){
+    printf("Out of memory: rho_species not allocated.\n");
     exit(1);
   }
   // potential
@@ -643,6 +619,8 @@ int main(int argc, char *argv[])
   }
   
   // generate initial condition
+  // for now gas shares the collisionless rotating disk initial condition,
+  // without hydro forces it behaves as a second collisionless species
   for(nn=0; nn<NUM_PARTICLES; nn++) {
     r[nn*NUM_DIMS + 0] = NUM_CELLS*(double)(rand())/RAND_MAX;
     r[nn*NUM_DIMS + 1] = NUM_CELLS*(double)(rand())/RAND_MAX;
@@ -799,7 +777,7 @@ int main(int argc, char *argv[])
     for(nn=0;nn<NUM_THREADS;nn++){
       thread_data_array[nn].thread_id=nn;
       thread_data_array[nn].r=r;
-      thread_data_array[nn].rho=&sub_rho[nn*NUM_CELLS*NUM_CELLS];
+      thread_data_array[nn].rho=sub_rho;
 
       thread_rc=pthread_create(&threads[nn], &attr, compute_rho_field_thread, (void *) &thread_data_array[nn]);
     
@@ -820,11 +798,16 @@ int main(int argc, char *argv[])
       }
     }
     
-    // sum sub_rho fields into rho
+    // sum sub_rho fields into per-species rho and total rho
     for(ii=0;ii<NUM_CELLS*NUM_CELLS;ii++){
       rho[ii] = 0.0;
-      for(nn=0;nn<NUM_THREADS;nn++){
-	rho[ii] += sub_rho[nn*NUM_CELLS*NUM_CELLS + ii];
+      for(s=0;s<NUM_SPECIES;s++){
+	acc = 0.0;
+	for(nn=0;nn<NUM_THREADS;nn++){
+	  acc += sub_rho[(s*NUM_THREADS + nn)*NUM_CELLS*NUM_CELLS + ii];
+	}
+	rho_species[s*NUM_CELLS*NUM_CELLS + ii] = acc;
+	rho[ii] += acc;
       }
     }
 
@@ -947,11 +930,26 @@ int main(int argc, char *argv[])
 #if SDL
       pixels=(Uint8 *)screen->pixels;
       SDL_LockSurface(screen);
+
+#if DISPLAY_SPECIES
+      // normalize each species by its mass fraction so a well mixed
+      // species has the same brightness as the total density display
+      for(s=0;s<NUM_SPECIES;s++){
+	acc = species[s].mass*(double)(species[s].count);
+	display_scale[s] = (acc > 0.0) ? NUM_PARTICLES*4.0/acc : 0.0;
+      }
+#endif
     
       for(jj=0; jj<NUM_CELLS; jj++){
 	for(ii=0; ii<NUM_CELLS; ii++){
 	  // get field value
 	  d=NUM_PARTICLES*4.0*rho[jj*NUM_CELLS+ii];
+#if DISPLAY_SPECIES
+	  d_dm=display_scale[SPECIES_DM]*rho_species[SPECIES_DM*NUM_CELLS*NUM_CELLS + jj*NUM_CELLS+ii];
+	  d_gas=display_scale[SPECIES_GAS]*rho_species[SPECIES_GAS*NUM_CELLS*NUM_CELLS + jj*NUM_CELLS+ii];
+	  d_dm=fmin(fmax(d_dm, 0.0), 255.0);
+	  d_gas=fmin(fmax(d_gas, 0.0), 255.0);
+#endif
 	  //d=-0.1*phi[jj*NUM_CELLS+ii];
 
 	  // clip value
@@ -973,10 +971,17 @@ int main(int argc, char *argv[])
 	      //pixels[3*(SCALE*jj+jj2)*screen->w+3*(SCALE*ii+ii2)+1]=(Uint8)(col->g*255.0);
 	      //pixels[3*(SCALE*jj+jj2)*screen->w+3*(SCALE*ii+ii2)+2]=(Uint8)(col->b*255.0);
 
+#if DISPLAY_SPECIES
+	      // display gas and collisionless densities in separate channels
+	      pixels[3*(SCALE*jj+jj2)*screen->w+3*(SCALE*ii+ii2)+0]=(Uint8)(d_gas);
+	      pixels[3*(SCALE*jj+jj2)*screen->w+3*(SCALE*ii+ii2)+1]=(Uint8)(0.5*(d_gas+d_dm));
+	      pixels[3*(SCALE*jj+jj2)*screen->w+3*(SCALE*ii+ii2)+2]=(Uint8)(d_dm);
+#else
 	      // display density of particles
 	      pixels[3*(SCALE*jj+jj2)*screen->w+3*(SCALE*ii+ii2)+0]=(Uint8)(d);
 	      pixels[3*(SCALE*jj+jj2)*screen->w+3*(SCALE*ii+ii2)+1]=(Uint8)(d);
 	      pixels[3*(SCALE*jj+jj2)*screen->w+3*(SCALE*ii+ii2)+2]=(Uint8)(d);
+#endif
 	    }
 	  }
 	}

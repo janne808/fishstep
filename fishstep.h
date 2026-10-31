@@ -22,6 +22,28 @@
 #ifndef __FISHSTEPH__
 #define __FISHSTEPH__
 
+// particle species
+// particles of each species are stored contiguously in the shared r, v, a
+// arrays: species s occupies indices [offset, offset + count)
+enum species_id{
+  SPECIES_DM = 0,   // collisionless (dark matter / stars)
+  SPECIES_GAS = 1,  // gas, to be coupled to PIC hydrodynamics
+  NUM_SPECIES = 2
+};
+
+struct species_info{
+  int offset;
+  int count;
+  double mass;
+};
+
+// split a contiguous particle range [offset, offset + count) into
+// num_threads slices and return the slice of thread_id in [*lo, *hi)
+static inline void thread_slice(int offset, int count, int thread_id, int num_threads, int *lo, int *hi){
+  *lo = offset + (int)((long)thread_id*count/num_threads);
+  *hi = offset + (int)((long)(thread_id + 1)*count/num_threads);
+}
+
 struct thread_data{
   int thread_id;
 
