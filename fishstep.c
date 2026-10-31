@@ -129,6 +129,18 @@
 #define Q_LIN 0.5
 #define Q_QUAD 2.0
 
+// FLIP/PIC blending: each step gas particle velocities relax by this fraction
+// towards the mass weighted mesh velocity, 0 is pure FLIP (particles keep
+// their own velocities), 1 is pure PIC; damps sub-cell particle noise
+#ifndef PIC_BLEND
+#define PIC_BLEND 0.15
+#endif
+
+// return the kinetic energy removed by PIC blending to internal energy
+#ifndef PIC_BLEND_HEAT
+#define PIC_BLEND_HEAT 1
+#endif
+
 // maximum time step
 #define DT 0.0095
 
@@ -636,13 +648,15 @@ void compute_gas_pressure(const double *grid_fields, double *press, double *du_m
   *v_max = sqrt(*v_max);
 }
 
-// add pressure acceleration to gas particles and compute du/dt
+// add pressure acceleration to gas particles, compute du/dt and blend
+// particle velocities towards the mesh velocity
 void *hydro_interpolation_thread(void *threadarg){
   int nn, lo, hi, ii, jj;
-  double *r, *a, *du;
-  const double *rho_gas, *press, *du_mesh;
+  double *r, *v, *a, *u, *du;
+  const double *rho_gas, *mx_gas, *my_gas, *press, *du_mesh;
   double dr[2];
   double gx, gy, rho_p;
+  double wx, wy;
 
   struct thread_data *my_data;
   int thread_id;
@@ -650,9 +664,13 @@ void *hydro_interpolation_thread(void *threadarg){
   my_data=(struct thread_data *) threadarg;
 
   r=my_data->r;
+  v=my_data->v;
   a=my_data->a;
+  u=my_data->u;
   du=my_data->du;
   rho_gas=&my_data->grid_fields[FIELD_RHO_GAS*NUM_CELLS*NUM_CELLS];
+  mx_gas=&my_data->grid_fields[FIELD_GAS_MOM_X*NUM_CELLS*NUM_CELLS];
+  my_gas=&my_data->grid_fields[FIELD_GAS_MOM_Y*NUM_CELLS*NUM_CELLS];
   press=my_data->press;
   du_mesh=my_data->du_mesh;
 
@@ -678,6 +696,20 @@ void *hydro_interpolation_thread(void *threadarg){
 
       // du/dt = -(P/rho) div(v), already divided by density on the mesh
       du[nn - species[SPECIES_GAS].offset] = cic_interp(du_mesh, ii, jj, dr, NUM_CELLS);
+
+      if(PIC_BLEND > 0.0) {
+	// velocity relative to the mass weighted mesh velocity at the particle
+	wx = v[nn*NUM_DIMS + 0] - cic_interp(mx_gas, ii, jj, dr, NUM_CELLS)/rho_p;
+	wy = v[nn*NUM_DIMS + 1] - cic_interp(my_gas, ii, jj, dr, NUM_CELLS)/rho_p;
+
+	v[nn*NUM_DIMS + 0] -= PIC_BLEND*wx;
+	v[nn*NUM_DIMS + 1] -= PIC_BLEND*wy;
+
+	// the removed relative kinetic energy becomes heat
+	if(PIC_BLEND_HEAT && !ISOTHERMAL) {
+	  u[nn - species[SPECIES_GAS].offset] += 0.5*PIC_BLEND*(2.0 - PIC_BLEND)*(wx*wx + wy*wy);
+	}
+      }
     }
     else {
       du[nn - species[SPECIES_GAS].offset] = 0.0;
@@ -1300,7 +1332,9 @@ int main(int argc, char *argv[])
 
     for(nn=0;nn<NUM_THREADS;nn++){
       thread_data_array[nn].r=r;
+      thread_data_array[nn].v=v;
       thread_data_array[nn].a=a;
+      thread_data_array[nn].u=u;
       thread_data_array[nn].du=du;
       thread_data_array[nn].grid_fields=rho_species;
       thread_data_array[nn].press=press;
