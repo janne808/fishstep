@@ -3,6 +3,8 @@ SDL=1
 TIFF_ENABLE=0
 OPTIMIZATION_LEVEL=3
 FFTW3_THREADS=1
+# DEBUG=1: debug symbols, no optimization; DEBUG=2: also address/UB sanitizers
+DEBUG=0
 
 # object files
 OBJ=fishstep.o
@@ -31,8 +33,19 @@ else
 	FFTW3_OPTS=
 endif
 
+# debug options
+ifeq ($(DEBUG),1)
+	OPTIMIZATION_LEVEL=0
+	DEBUG_OPTS=-g3
+else ifeq ($(DEBUG),2)
+	OPTIMIZATION_LEVEL=0
+	DEBUG_OPTS=-g3 -fsanitize=address,undefined -fno-omit-frame-pointer
+else
+	DEBUG_OPTS=
+endif
+
 # compiler options
-OPTS=-Wall -pthread
+OPTS=-Wall -pthread $(DEBUG_OPTS)
 CFLAGS=-O$(OPTIMIZATION_LEVEL) -lm -lrt -lfftw3
 
 fishstep: 	$(OBJ)

@@ -72,10 +72,36 @@
 #define DM_MASS ((1.0 - GAS_MASS_FRACTION)/(double)(NUM_DM_PARTICLES))
 #define GAS_MASS (GAS_MASS_FRACTION/(double)(NUM_GAS_PARTICLES))
 
-// size of the per-species, per-thread rho subfield buffer
-#define SUB_RHO_SIZE (NUM_SPECIES*NUM_THREADS*NUM_CELLS*NUM_CELLS)
+// size of the per-field, per-thread mesh subfield buffer
+#define SUB_FIELD_SIZE (NUM_GRID_FIELDS*NUM_THREADS*NUM_CELLS*NUM_CELLS)
 
-#define DT 0.0095;
+// gas equation of state
+// ISOTHERMAL=1: P = CS_ISO^2 rho, internal energy is not evolved
+// ISOTHERMAL=0: ideal gas P = (GAMMA - 1) rho u with adiabatic du/dt
+#define ISOTHERMAL 0
+#define GAMMA (5.0/3.0)
+#define CS_ISO 5.0
+
+// initial gas sound speed in cells per time unit, sets initial u
+#define CS_INIT 5.0
+#define U_INIT (CS_INIT*CS_INIT/(GAMMA*(GAMMA - 1.0)))
+
+// internal energy floor
+#define U_MIN 1.0e-6
+
+// gas density below which a cell is treated as empty
+#define RHO_GAS_FLOOR (1.0e-3*GAS_MASS)
+
+// von Neumann-Richtmyer artificial viscosity, linear and quadratic terms,
+// applied in converging flow only
+#define Q_LIN 0.5
+#define Q_QUAD 2.0
+
+// maximum time step
+#define DT 0.0095
+
+// target CFL number for the adaptive time step, gas signal speed*dt/cell
+#define CFL_TARGET 0.4
 
 #define G 4.0*M_PI*M_PI;
 
@@ -156,6 +182,22 @@ void writeframe(char* path, SDL_Surface *screen){
 }
 #endif
 
+// half kick of gas internal energy for the gas slice of a thread
+static void kick_internal_energy(double *u, double *du, double dt, int thread_id){
+#if !ISOTHERMAL
+  int lo, hi, gg;
+
+  thread_slice(0, NUM_GAS_PARTICLES, thread_id, NUM_THREADS, &lo, &hi);
+
+  for(gg=lo; gg<hi; gg++) {
+    u[gg] += 0.5*dt*du[gg];
+    if(u[gg] < U_MIN) {
+      u[gg] = U_MIN;
+    }
+  }
+#endif
+}
+
 // particle kick-drift thread 
 void *integration_kick_drift_thread(void *threadarg){
   // loop variables
@@ -167,6 +209,7 @@ void *integration_kick_drift_thread(void *threadarg){
 
   // thread variables
   double *r, *v, *a;
+  double *u, *du;
   double dt;
 
   // thread data pointer
@@ -182,6 +225,8 @@ void *integration_kick_drift_thread(void *threadarg){
   v=my_data->v;
   a=my_data->a;
   dt=my_data->dt;
+  u=my_data->u;
+  du=my_data->du;
 
   thread_id=my_data->thread_id;
 
@@ -196,19 +241,12 @@ void *integration_kick_drift_thread(void *threadarg){
     r[ii*NUM_DIMS + 1] += dt*v[ii*NUM_DIMS + 1];
 
     // enforce periodic boundaries
-    if(r[ii*NUM_DIMS + 0] > (double)(NUM_CELLS)) {
-      r[ii*NUM_DIMS + 0] -= (double)(NUM_CELLS);
-    }
-    else if(r[ii*NUM_DIMS + 0] < (double)(0)) {
-      r[ii*NUM_DIMS + 0] += (double)(NUM_CELLS);
-    }
-    if(r[ii*NUM_DIMS + 1] > (double)(NUM_CELLS)) {
-      r[ii*NUM_DIMS + 1] -= (double)(NUM_CELLS);
-    }
-    else if(r[ii*NUM_DIMS + 1] < (double)(0)) {
-      r[ii*NUM_DIMS + 1] += (double)(NUM_CELLS);
-    }
+    r[ii*NUM_DIMS + 0] = wrap_periodic(r[ii*NUM_DIMS + 0], (double)(NUM_CELLS));
+    r[ii*NUM_DIMS + 1] = wrap_periodic(r[ii*NUM_DIMS + 1], (double)(NUM_CELLS));
   }
+
+  // half kick gas internal energy
+  kick_internal_energy(u, du, dt, thread_id);
 
   pthread_exit(NULL);
 }
@@ -224,6 +262,7 @@ void *integration_kick_thread(void *threadarg){
 
   // thread variables
   double *v, *a;
+  double *u, *du;
   double dt;
 
   // thread data pointer
@@ -238,6 +277,8 @@ void *integration_kick_thread(void *threadarg){
   v=my_data->v;
   a=my_data->a;
   dt=my_data->dt;
+  u=my_data->u;
+  du=my_data->du;
 
   thread_id=my_data->thread_id;
 
@@ -249,6 +290,9 @@ void *integration_kick_thread(void *threadarg){
     v[ii*NUM_DIMS + 0] += 0.5*dt*a[ii*NUM_DIMS + 0];
     v[ii*NUM_DIMS + 1] += 0.5*dt*a[ii*NUM_DIMS + 1];
   }
+
+  // half kick gas internal energy
+  kick_internal_energy(u, du, dt, thread_id);
 
   pthread_exit(NULL);
 }
@@ -278,8 +322,8 @@ void *zero_rho_field_thread(void *threadarg){
   thread_id=my_data->thread_id;
 
   // compute thread slice
-  lo=thread_id*(SUB_RHO_SIZE/NUM_THREADS);
-  hi=(thread_id+1)*(SUB_RHO_SIZE/NUM_THREADS);
+  lo=thread_id*(SUB_FIELD_SIZE/NUM_THREADS);
+  hi=(thread_id+1)*(SUB_FIELD_SIZE/NUM_THREADS);
 
   for(nn=lo; nn<hi; nn++) {
     sub_rho[nn] = 0.0;
@@ -335,11 +379,14 @@ void *compute_rho_field_thread(void *threadarg){
   int hi;
 
   // thread variables
-  int ii,jj;
+  int ii,jj,kk;
   int s;
-  double *r, *sub_rho, *rho;
+  double *r, *v, *u, *sub_rho, *rho;
+  double *e_gas, *mx_gas, *my_gas;
   double dr[2];
+  double w[4];
   double mass;
+  int c[4];
 
   // thread data pointer
   struct thread_data *my_data;
@@ -351,9 +398,16 @@ void *compute_rho_field_thread(void *threadarg){
   my_data=(struct thread_data *) threadarg;
 
   r=my_data->r;
+  v=my_data->v;
+  u=my_data->u;
   sub_rho=my_data->rho;
 
   thread_id=my_data->thread_id;
+
+  // gas energy and momentum subfields of this thread
+  e_gas=&sub_rho[(FIELD_GAS_ENERGY*NUM_THREADS + thread_id)*NUM_CELLS*NUM_CELLS];
+  mx_gas=&sub_rho[(FIELD_GAS_MOM_X*NUM_THREADS + thread_id)*NUM_CELLS*NUM_CELLS];
+  my_gas=&sub_rho[(FIELD_GAS_MOM_Y*NUM_THREADS + thread_id)*NUM_CELLS*NUM_CELLS];
 
   // deposit each species into its own per-thread subfield
   for(s=0; s<NUM_SPECIES; s++) {
@@ -371,10 +425,28 @@ void *compute_rho_field_thread(void *threadarg){
       dr[0] = r[nn*NUM_DIMS + 0] - (double)(ii);
       dr[1] = r[nn*NUM_DIMS + 1] - (double)(jj);
 
-      rho[jj*NUM_CELLS + ii] += (1.0 - dr[0])*(1.0 - dr[1])*mass;
-      rho[jj*NUM_CELLS + modulo(ii+1, NUM_CELLS)] += (dr[0])*(1.0 - dr[1])*mass;
-      rho[modulo(jj+1, NUM_CELLS)*NUM_CELLS + ii] += (1.0 - dr[0])*(dr[1])*mass;
-      rho[modulo(jj+1, NUM_CELLS)*NUM_CELLS + modulo(ii+1, NUM_CELLS)] += (dr[0])*(dr[1])*mass;
+      c[0] = jj*NUM_CELLS + ii;
+      c[1] = jj*NUM_CELLS + modulo(ii+1, NUM_CELLS);
+      c[2] = modulo(jj+1, NUM_CELLS)*NUM_CELLS + ii;
+      c[3] = modulo(jj+1, NUM_CELLS)*NUM_CELLS + modulo(ii+1, NUM_CELLS);
+
+      w[0] = (1.0 - dr[0])*(1.0 - dr[1])*mass;
+      w[1] = (dr[0])*(1.0 - dr[1])*mass;
+      w[2] = (1.0 - dr[0])*(dr[1])*mass;
+      w[3] = (dr[0])*(dr[1])*mass;
+
+      for(kk=0; kk<4; kk++) {
+	rho[c[kk]] += w[kk];
+      }
+
+      // gas also deposits internal energy and momentum
+      if(s == SPECIES_GAS) {
+	for(kk=0; kk<4; kk++) {
+	  e_gas[c[kk]] += w[kk]*u[nn - species[SPECIES_GAS].offset];
+	  mx_gas[c[kk]] += w[kk]*v[nn*NUM_DIMS + 0];
+	  my_gas[c[kk]] += w[kk]*v[nn*NUM_DIMS + 1];
+	}
+      }
     }
   }
 
@@ -442,6 +514,176 @@ void *acceleration_interpolation_thread(void *threadarg){
   pthread_exit(NULL);
 }
 
+// compute gas pressure including artificial viscosity and specific internal
+// energy rate -(P/rho) div(v) on the mesh, returns maximum sound speed and velocity
+void compute_gas_pressure(const double *grid_fields, double *press, double *du_mesh, double *vel, double *cs_max, double *v_max){
+  int ii, jj, nn;
+  int nxp, nxm, nyp, nym;
+  double rho, cs2, divv, q, vabs;
+
+  const double *rho_gas = &grid_fields[FIELD_RHO_GAS*NUM_CELLS*NUM_CELLS];
+  const double *e_gas = &grid_fields[FIELD_GAS_ENERGY*NUM_CELLS*NUM_CELLS];
+  const double *mx_gas = &grid_fields[FIELD_GAS_MOM_X*NUM_CELLS*NUM_CELLS];
+  const double *my_gas = &grid_fields[FIELD_GAS_MOM_Y*NUM_CELLS*NUM_CELLS];
+  double *vx = &vel[0];
+  double *vy = &vel[NUM_CELLS*NUM_CELLS];
+
+  *cs_max = 0.0;
+  *v_max = 0.0;
+
+  // mesh velocity and thermal pressure
+  for(nn=0; nn<NUM_CELLS*NUM_CELLS; nn++) {
+    rho = rho_gas[nn];
+    if(rho > RHO_GAS_FLOOR) {
+      vx[nn] = mx_gas[nn]/rho;
+      vy[nn] = my_gas[nn]/rho;
+#if ISOTHERMAL
+      press[nn] = CS_ISO*CS_ISO*rho;
+#else
+      press[nn] = (GAMMA - 1.0)*e_gas[nn];
+#endif
+    }
+    else {
+      vx[nn] = 0.0;
+      vy[nn] = 0.0;
+      press[nn] = 0.0;
+    }
+  }
+
+  // velocity divergence, artificial viscosity and p div v
+  for(jj=0; jj<NUM_CELLS; jj++) {
+    for(ii=0; ii<NUM_CELLS; ii++) {
+      nn = jj*NUM_CELLS + ii;
+      rho = rho_gas[nn];
+
+      if(rho <= RHO_GAS_FLOOR) {
+	du_mesh[nn] = 0.0;
+	continue;
+      }
+
+      // central difference divergence, empty neighbors take the velocity of
+      // this cell so the gas edge does not show up as spurious compression
+      nxp = jj*NUM_CELLS + modulo(ii+1, NUM_CELLS);
+      nxm = jj*NUM_CELLS + modulo(ii-1, NUM_CELLS);
+      nyp = modulo(jj+1, NUM_CELLS)*NUM_CELLS + ii;
+      nym = modulo(jj-1, NUM_CELLS)*NUM_CELLS + ii;
+
+      divv = 0.5*(((rho_gas[nxp] > RHO_GAS_FLOOR) ? vx[nxp] : vx[nn]) -
+		  ((rho_gas[nxm] > RHO_GAS_FLOOR) ? vx[nxm] : vx[nn])) +
+	0.5*(((rho_gas[nyp] > RHO_GAS_FLOOR) ? vy[nyp] : vy[nn]) -
+	     ((rho_gas[nym] > RHO_GAS_FLOOR) ? vy[nym] : vy[nn]));
+
+#if ISOTHERMAL
+      cs2 = CS_ISO*CS_ISO;
+#else
+      cs2 = GAMMA*press[nn]/rho;
+#endif
+
+      if(cs2 > *cs_max) {
+	*cs_max = cs2;
+      }
+      vabs = vx[nn]*vx[nn] + vy[nn]*vy[nn];
+      if(vabs > *v_max) {
+	*v_max = vabs;
+      }
+
+      // viscous pressure in converging flow, cell size is 1
+      q = 0.0;
+      if(divv < 0.0) {
+	q = rho*(Q_LIN*sqrt(cs2)*(-divv) + Q_QUAD*divv*divv);
+      }
+
+      press[nn] += q;
+
+      // specific internal energy rate -(P/rho) div v
+      du_mesh[nn] = -press[nn]*divv/rho;
+    }
+  }
+
+  *cs_max = sqrt(*cs_max);
+  *v_max = sqrt(*v_max);
+}
+
+// add pressure acceleration to gas particles and compute du/dt
+void *hydro_interpolation_thread(void *threadarg){
+  int nn, lo, hi, ii, jj;
+  double *r, *a, *du;
+  const double *rho_gas, *press, *du_mesh;
+  double dr[2];
+  double gx, gy, rho_p;
+
+  struct thread_data *my_data;
+  int thread_id;
+
+  my_data=(struct thread_data *) threadarg;
+
+  r=my_data->r;
+  a=my_data->a;
+  du=my_data->du;
+  rho_gas=&my_data->grid_fields[FIELD_RHO_GAS*NUM_CELLS*NUM_CELLS];
+  press=my_data->press;
+  du_mesh=my_data->du_mesh;
+
+  thread_id=my_data->thread_id;
+
+  thread_slice(species[SPECIES_GAS].offset, species[SPECIES_GAS].count, thread_id, NUM_THREADS, &lo, &hi);
+
+  for(nn=lo; nn<hi; nn++) {
+    ii = floor(r[nn*NUM_DIMS + 0]);
+    jj = floor(r[nn*NUM_DIMS + 1]);
+
+    dr[0] = r[nn*NUM_DIMS + 0] - (double)(ii);
+    dr[1] = r[nn*NUM_DIMS + 1] - (double)(jj);
+
+    // gas density at particle, nonzero since the particle deposited itself
+    rho_p = cic_interp(rho_gas, ii, jj, dr, NUM_CELLS);
+
+    if(rho_p > 0.0) {
+      // a = -grad(P)/rho
+      cic_neg_gradient(press, ii, jj, dr, NUM_CELLS, &gx, &gy);
+      a[nn*NUM_DIMS + 0] += gx/rho_p;
+      a[nn*NUM_DIMS + 1] += gy/rho_p;
+
+      // du/dt = -(P/rho) div(v), already divided by density on the mesh
+      du[nn - species[SPECIES_GAS].offset] = cic_interp(du_mesh, ii, jj, dr, NUM_CELLS);
+    }
+    else {
+      du[nn - species[SPECIES_GAS].offset] = 0.0;
+    }
+  }
+
+  pthread_exit(NULL);
+}
+
+// launch NUM_THREADS threads of fn on thread_data_array and join them
+void run_threads(void *(*fn)(void *)){
+  int nn, thread_rc;
+  pthread_t threads[NUM_THREADS];
+  pthread_attr_t attr;
+  void *thread_status;
+
+  pthread_attr_init(&attr);
+  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+
+  for(nn=0; nn<NUM_THREADS; nn++){
+    thread_data_array[nn].thread_id=nn;
+    thread_rc=pthread_create(&threads[nn], &attr, fn, (void *) &thread_data_array[nn]);
+    if(thread_rc){
+      printf("ERROR: pthread_create() returned %d.\n", thread_rc);
+      exit(-1);
+    }
+  }
+
+  pthread_attr_destroy(&attr);
+  for(nn=0; nn<NUM_THREADS; nn++){
+    thread_rc=pthread_join(threads[nn], &thread_status);
+    if(thread_rc){
+      printf("ERROR: pthread_join() returned %d.\n", thread_rc);
+      exit(-1);
+    }
+  }
+}
+
 /* compute time difference in seconds and nanoseconds */
 void timediff(struct timespec start, struct timespec end, struct timespec *out){
   /* compute time difference */
@@ -460,6 +702,7 @@ int main(int argc, char *argv[])
   // loop variables
   int nn;
   int tt;
+  double sim_time;
   int steps;
   int ii;
   int jj;
@@ -475,6 +718,9 @@ int main(int argc, char *argv[])
   double vv;
   
   double *rho, *sub_rho, *rho_species;
+  double *u, *du;
+  double *press, *du_mesh, *gas_vel;
+  double cs_max, v_max, e_thermal;
   double acc;
   int s;
   double *phi;
@@ -563,15 +809,30 @@ int main(int argc, char *argv[])
     printf("Out of memory: rho not allocated.\n");
     exit(1);
   }
-  sub_rho=(double *)malloc(SUB_RHO_SIZE*sizeof(double));
+  sub_rho=(double *)malloc(SUB_FIELD_SIZE*sizeof(double));
   if(!sub_rho){
     printf("Out of memory: sub_rho not allocated.\n");
     exit(1);
   }
-  // density per species
-  rho_species=(double *)malloc(NUM_SPECIES*NUM_CELLS*NUM_CELLS*sizeof(double));
+  // summed mesh fields, species densities first
+  rho_species=(double *)malloc(NUM_GRID_FIELDS*NUM_CELLS*NUM_CELLS*sizeof(double));
   if(!rho_species){
     printf("Out of memory: rho_species not allocated.\n");
+    exit(1);
+  }
+  // gas internal energy and its time derivative
+  u=(double *)malloc(NUM_GAS_PARTICLES*sizeof(double));
+  du=(double *)malloc(NUM_GAS_PARTICLES*sizeof(double));
+  if(!u || !du){
+    printf("Out of memory: u or du not allocated.\n");
+    exit(1);
+  }
+  // gas pressure, du/dt and mesh velocity
+  press=(double *)malloc(NUM_CELLS*NUM_CELLS*sizeof(double));
+  du_mesh=(double *)malloc(NUM_CELLS*NUM_CELLS*sizeof(double));
+  gas_vel=(double *)malloc(2*NUM_CELLS*NUM_CELLS*sizeof(double));
+  if(!press || !du_mesh || !gas_vel){
+    printf("Out of memory: gas pressure fields not allocated.\n");
     exit(1);
   }
   // potential
@@ -646,6 +907,18 @@ int main(int argc, char *argv[])
     a[nn*NUM_DIMS + 0] = 0.0;
     a[nn*NUM_DIMS + 1] = 0.0;
   }
+
+  // gas internal energy
+  for(nn=0; nn<NUM_GAS_PARTICLES; nn++) {
+#if ISOTHERMAL
+    u[nn] = CS_ISO*CS_ISO/(GAMMA - 1.0);
+#else
+    u[nn] = U_INIT;
+#endif
+    du[nn] = 0.0;
+  }
+  cs_max = 0.0;
+  v_max = 0.0;
   
   // compute gravitational green's function in k-space
   for(jj=0; jj<NUM_CELLS/2; jj++) {
@@ -691,6 +964,7 @@ int main(int argc, char *argv[])
   // integrate time steps
   done=0;
   tt=0;
+  sim_time=0.0;
   steps=0;
   
 #if TIFF_ENABLE
@@ -722,6 +996,8 @@ int main(int argc, char *argv[])
       thread_data_array[nn].r=r;
       thread_data_array[nn].v=v;
       thread_data_array[nn].a=a;
+      thread_data_array[nn].u=u;
+      thread_data_array[nn].du=du;
       thread_data_array[nn].dt=dt;
 
       thread_rc=pthread_create(&threads[nn], &attr, integration_kick_drift_thread, (void *) &thread_data_array[nn]);
@@ -777,6 +1053,8 @@ int main(int argc, char *argv[])
     for(nn=0;nn<NUM_THREADS;nn++){
       thread_data_array[nn].thread_id=nn;
       thread_data_array[nn].r=r;
+      thread_data_array[nn].v=v;
+      thread_data_array[nn].u=u;
       thread_data_array[nn].rho=sub_rho;
 
       thread_rc=pthread_create(&threads[nn], &attr, compute_rho_field_thread, (void *) &thread_data_array[nn]);
@@ -798,16 +1076,18 @@ int main(int argc, char *argv[])
       }
     }
     
-    // sum sub_rho fields into per-species rho and total rho
+    // sum thread subfields into mesh fields, species densities into total rho
     for(ii=0;ii<NUM_CELLS*NUM_CELLS;ii++){
       rho[ii] = 0.0;
-      for(s=0;s<NUM_SPECIES;s++){
+      for(s=0;s<NUM_GRID_FIELDS;s++){
 	acc = 0.0;
 	for(nn=0;nn<NUM_THREADS;nn++){
 	  acc += sub_rho[(s*NUM_THREADS + nn)*NUM_CELLS*NUM_CELLS + ii];
 	}
 	rho_species[s*NUM_CELLS*NUM_CELLS + ii] = acc;
-	rho[ii] += acc;
+	if(s < NUM_SPECIES){
+	  rho[ii] += acc;
+	}
       }
     }
 
@@ -888,6 +1168,19 @@ int main(int argc, char *argv[])
       }
     }
     
+    // gas pressure on the mesh and pressure acceleration on gas particles
+    compute_gas_pressure(rho_species, press, du_mesh, gas_vel, &cs_max, &v_max);
+
+    for(nn=0;nn<NUM_THREADS;nn++){
+      thread_data_array[nn].r=r;
+      thread_data_array[nn].a=a;
+      thread_data_array[nn].du=du;
+      thread_data_array[nn].grid_fields=rho_species;
+      thread_data_array[nn].press=press;
+      thread_data_array[nn].du_mesh=du_mesh;
+    }
+    run_threads(hydro_interpolation_thread);
+
     // create kick integration threads
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
@@ -897,6 +1190,8 @@ int main(int argc, char *argv[])
       thread_data_array[nn].r=r;
       thread_data_array[nn].v=v;
       thread_data_array[nn].a=a;
+      thread_data_array[nn].u=u;
+      thread_data_array[nn].du=du;
       thread_data_array[nn].dt=dt;
 
       thread_rc=pthread_create(&threads[nn], &attr, integration_kick_thread, (void *) &thread_data_array[nn]);
@@ -993,8 +1288,17 @@ int main(int argc, char *argv[])
     
       timediff(time1, time2, &int_time);
 
-      // print state
-      printf("tt: %d steps/s: %d\n", tt, (int)(steps/((double)(int_time.tv_sec)+(double)(int_time.tv_nsec)*1.0E-9)));
+      // gas thermal energy
+      e_thermal = 0.0;
+      for(nn=0; nn<NUM_GAS_PARTICLES; nn++) {
+	e_thermal += GAS_MASS*u[nn];
+      }
+
+      // print state, CFL is the gas signal speed times dt over cell size
+      printf("tt: %d t: %.4f dt: %.3e steps/s: %d E_th: %.6e cs_max: %.3f v_max: %.3f CFL: %.3f\n", tt,
+	     sim_time, dt,
+	     (int)(steps/((double)(int_time.tv_sec)+(double)(int_time.tv_nsec)*1.0E-9)),
+	     e_thermal, cs_max, v_max, (cs_max + v_max)*dt);
 
 #if TIFF_ENABLE
       sprintf(filename, "/home/janne808/testrun/%08d.tif", tiff_frame++);
@@ -1007,6 +1311,14 @@ int main(int argc, char *argv[])
       // reset steps variable
       steps = -1;
     }
+    // adaptive time step for the next step from the gas CFL condition,
+    // changed only between full steps so both half kicks use the same dt
+    sim_time += dt;
+    dt = DT;
+    if((cs_max + v_max)*DT > CFL_TARGET) {
+      dt = CFL_TARGET/(cs_max + v_max);
+    }
+
     // update time step variable
     tt++;
     steps++;

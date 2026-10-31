@@ -31,6 +31,17 @@ enum species_id{
   NUM_SPECIES = 2
 };
 
+// mesh fields deposited from particles with cloud in cell weights
+// the first NUM_SPECIES fields are the species mass densities
+enum grid_field_id{
+  FIELD_RHO_DM = SPECIES_DM,
+  FIELD_RHO_GAS = SPECIES_GAS,
+  FIELD_GAS_ENERGY = NUM_SPECIES,  // gas internal energy density, sum of m*u
+  FIELD_GAS_MOM_X,                 // gas momentum density, sum of m*v_x
+  FIELD_GAS_MOM_Y,                 // gas momentum density, sum of m*v_y
+  NUM_GRID_FIELDS
+};
+
 struct species_info{
   int offset;
   int count;
@@ -54,12 +65,22 @@ struct thread_data{
   double *phi;
   double *rho;
   fftw_complex *rho_complex;
-  
+
+  // gas specific internal energy and its time derivative, indexed by
+  // gas particle number (particle index minus gas species offset)
+  double *u;
+  double *du;
+
+  // summed mesh fields, gas pressure and specific internal energy rate
+  double *grid_fields;
+  double *press;
+  double *du_mesh;
+
   double dt;
 };
 
 // vector norm
-inline double vector_norm(double *r, int dim) {
+static inline double vector_norm(double *r, int dim) {
   int ii;
   double s=0;
   
@@ -71,13 +92,58 @@ inline double vector_norm(double *r, int dim) {
 }
 
 // custom modulo function to patch C style % operator
-inline int modulo(int x, int mod){
+static inline int modulo(int x, int mod){
   if(x >= 0 && x < mod){
     return x;
   }
   else{
     return ((x % mod) + mod) % mod;
   }
+}
+
+// wrap a coordinate into the periodic interval [0, L)
+static inline double wrap_periodic(double x, double L){
+  x = fmod(x, L);
+  if(x < 0.0) {
+    x += L;
+  }
+  // a tiny negative x rounds to exactly L after the shift
+  if(x >= L) {
+    x = 0.0;
+  }
+  return x;
+}
+
+// cloud in cell interpolation of a periodic field f to offset dr inside cell (ii, jj)
+static inline double cic_interp(const double *f, int ii, int jj, const double *dr, int n){
+  int ip = modulo(ii+1, n);
+  int jp = modulo(jj+1, n);
+
+  return f[jj*n + ii]*(1.0 - dr[0])*(1.0 - dr[1]) +
+    f[jj*n + ip]*(dr[0])*(1.0 - dr[1]) +
+    f[jp*n + ii]*(1.0 - dr[0])*(dr[1]) +
+    f[jp*n + ip]*(dr[0])*(dr[1]);
+}
+
+// cloud in cell interpolation of the negative gradient of a periodic field f,
+// gradient taken with 2nd order central differences at the cell nodes
+static inline void cic_neg_gradient(const double *f, int ii, int jj, const double *dr, int n, double *gx, double *gy){
+  int im = modulo(ii-1, n), ip = modulo(ii+1, n), ip2 = modulo(ii+2, n);
+  int jm = modulo(jj-1, n), jp = modulo(jj+1, n), jp2 = modulo(jj+2, n);
+  double w00 = (1.0 - dr[0])*(1.0 - dr[1]);
+  double w10 = (dr[0])*(1.0 - dr[1]);
+  double w01 = (1.0 - dr[0])*(dr[1]);
+  double w11 = (dr[0])*(dr[1]);
+
+  *gx = 0.5*((f[jj*n + im] - f[jj*n + ip])*w00 +
+	     (f[jj*n + ii] - f[jj*n + ip2])*w10 +
+	     (f[jp*n + im] - f[jp*n + ip])*w01 +
+	     (f[jp*n + ii] - f[jp*n + ip2])*w11);
+
+  *gy = 0.5*((f[jm*n + ii] - f[jp*n + ii])*w00 +
+	     (f[jm*n + ip] - f[jp*n + ip])*w10 +
+	     (f[jj*n + ii] - f[jp2*n + ii])*w01 +
+	     (f[jj*n + ip] - f[jp2*n + ip])*w11);
 }
 
 #endif
