@@ -50,13 +50,45 @@
 // number of cells per dimension
 #define NUM_CELLS 512
 
+// test problem, 0: self-gravitating rotating disk
+// 1: Sod shock tube along x, gas only, no gravity, writes shocktube.dat at T_END
+#ifndef SHOCK_TUBE
+#define SHOCK_TUBE 0
+#endif
+
+#if SHOCK_TUBE
+// high pressure gas in NUM_CELLS/4 <= x < 3*NUM_CELLS/4, low pressure outside,
+// periodic box so there are two mirrored Riemann problems
+// particles on a regular lattice, ST_PPC_*_X by ST_PPC_*_Y per cell,
+// equal particle masses so the density ratio is the particle count ratio
+#define ST_PPC_L_X 8
+#define ST_PPC_L_Y 4
+#define ST_PPC_R_X 2
+#define ST_PPC_R_Y 2
+
+// left state sound speed and pressure ratio P_R/P_L, Sod: rho_R/rho_L = 1/8
+#define ST_CS_L 10.0
+#define ST_P_RATIO 0.1
+
+#define NUM_DM_PARTICLES 0
+#define NUM_GAS_PARTICLES ((NUM_CELLS*NUM_CELLS/2)*(ST_PPC_L_X*ST_PPC_L_Y + ST_PPC_R_X*ST_PPC_R_Y))
+#define GAS_MASS_FRACTION 1.0
+#define GRAVITY 0
+#define T_END 5.0
+#else
 // number of particles per species
 #define NUM_DM_PARTICLES (4*512000)
 #define NUM_GAS_PARTICLES (1*512000)
-#define NUM_PARTICLES (NUM_DM_PARTICLES + NUM_GAS_PARTICLES)
 
 // gas fraction of the total mass, total mass is normalized to 1
 #define GAS_MASS_FRACTION 0.16
+
+// self-gravity on, run until the window is closed
+#define GRAVITY 1
+#define T_END 0.0
+#endif
+
+#define NUM_PARTICLES (NUM_DM_PARTICLES + NUM_GAS_PARTICLES)
 
 // display both species in separate color channels instead of total density
 #define DISPLAY_SPECIES 1
@@ -69,8 +101,8 @@
 #define NUM_DIMS 2
 
 // particle mass per species
-#define DM_MASS ((1.0 - GAS_MASS_FRACTION)/(double)(NUM_DM_PARTICLES))
-#define GAS_MASS (GAS_MASS_FRACTION/(double)(NUM_GAS_PARTICLES))
+#define DM_MASS ((NUM_DM_PARTICLES) > 0 ? (1.0 - GAS_MASS_FRACTION)/(double)(NUM_DM_PARTICLES) : 0.0)
+#define GAS_MASS ((NUM_GAS_PARTICLES) > 0 ? GAS_MASS_FRACTION/(double)(NUM_GAS_PARTICLES) : 0.0)
 
 // size of the per-field, per-thread mesh subfield buffer
 #define SUB_FIELD_SIZE (NUM_GRID_FIELDS*NUM_THREADS*NUM_CELLS*NUM_CELLS)
@@ -684,6 +716,90 @@ void run_threads(void *(*fn)(void *)){
   }
 }
 
+#if SHOCK_TUBE
+// gas density, pressure and internal energy of the left (high pressure) state
+#define ST_RHO_L (GAS_MASS*ST_PPC_L_X*ST_PPC_L_Y)
+#define ST_RHO_R (GAS_MASS*ST_PPC_R_X*ST_PPC_R_Y)
+#define ST_U_L (ST_CS_L*ST_CS_L/(GAMMA*(GAMMA - 1.0)))
+#define ST_U_R (ST_U_L*ST_P_RATIO*ST_RHO_L/ST_RHO_R)
+
+// Sod shock tube initial condition on a regular particle lattice
+void init_shock_tube(double *r, double *v, double *a, double *u, double *du){
+  int ii, jj, px, py, nx, ny;
+  int nn = 0;
+  int left;
+
+  for(jj=0; jj<NUM_CELLS; jj++) {
+    for(ii=0; ii<NUM_CELLS; ii++) {
+      left = (ii >= NUM_CELLS/4 && ii < 3*NUM_CELLS/4);
+      nx = left ? ST_PPC_L_X : ST_PPC_R_X;
+      ny = left ? ST_PPC_L_Y : ST_PPC_R_Y;
+
+      for(py=0; py<ny; py++) {
+	for(px=0; px<nx; px++) {
+	  r[nn*NUM_DIMS + 0] = ii + (px + 0.5)/nx;
+	  r[nn*NUM_DIMS + 1] = jj + (py + 0.5)/ny;
+	  v[nn*NUM_DIMS + 0] = 0.0;
+	  v[nn*NUM_DIMS + 1] = 0.0;
+	  a[nn*NUM_DIMS + 0] = 0.0;
+	  a[nn*NUM_DIMS + 1] = 0.0;
+	  u[nn] = left ? ST_U_L : ST_U_R;
+	  du[nn] = 0.0;
+	  nn++;
+	}
+      }
+    }
+  }
+
+  if(nn != NUM_GAS_PARTICLES) {
+    printf("Shock tube lattice placed %d particles, expected %d.\n", nn, NUM_GAS_PARTICLES);
+    exit(1);
+  }
+}
+
+// write y averaged gas profiles along x, normalized to the right state
+// density and pressure, columns: x rho v_x P u
+void write_shock_tube_profile(const char *path, const double *grid_fields, double t){
+  int ii, jj, nn;
+  double rho, mx, e;
+  FILE *fp;
+
+  const double *rho_gas = &grid_fields[FIELD_RHO_GAS*NUM_CELLS*NUM_CELLS];
+  const double *e_gas = &grid_fields[FIELD_GAS_ENERGY*NUM_CELLS*NUM_CELLS];
+  const double *mx_gas = &grid_fields[FIELD_GAS_MOM_X*NUM_CELLS*NUM_CELLS];
+  double p_r = (GAMMA - 1.0)*ST_RHO_R*ST_U_R;
+
+  fp = fopen(path, "w");
+  if(!fp) {
+    printf("Could not open %s for writing.\n", path);
+    return;
+  }
+
+  // p_over_rho_R is the velocity unit squared of the normalized profile
+  fprintf(fp, "# t %.10g gamma %.10g rho_L %.10g P_L %.10g x_L %d x_R %d p_over_rho_R %.10g\n",
+	  t, GAMMA, ST_RHO_L/ST_RHO_R, (GAMMA - 1.0)*ST_RHO_L*ST_U_L/p_r, NUM_CELLS/4, 3*NUM_CELLS/4,
+	  (GAMMA - 1.0)*ST_U_R);
+  fprintf(fp, "# x rho v_x P u\n");
+
+  for(ii=0; ii<NUM_CELLS; ii++) {
+    rho = 0.0;
+    mx = 0.0;
+    e = 0.0;
+    for(jj=0; jj<NUM_CELLS; jj++) {
+      nn = jj*NUM_CELLS + ii;
+      rho += rho_gas[nn];
+      mx += mx_gas[nn];
+      e += e_gas[nn];
+    }
+    // mesh nodes sit at integer coordinates
+    fprintf(fp, "%d %.10g %.10g %.10g %.10g\n", ii,
+	    rho/NUM_CELLS/ST_RHO_R, mx/rho, (GAMMA - 1.0)*e/NUM_CELLS/p_r, e/rho);
+  }
+
+  fclose(fp);
+}
+#endif
+
 /* compute time difference in seconds and nanoseconds */
 void timediff(struct timespec start, struct timespec end, struct timespec *out){
   /* compute time difference */
@@ -712,10 +828,12 @@ int main(int argc, char *argv[])
   double *v;
   double *a;
 
+#if !SHOCK_TUBE
   // initial condition variables
   double r2[NUM_DIMS];
   double dd;
   double vv;
+#endif
   
   double *rho, *sub_rho, *rho_species;
   double *u, *du;
@@ -880,8 +998,10 @@ int main(int argc, char *argv[])
   }
   
   // generate initial condition
-  // for now gas shares the collisionless rotating disk initial condition,
-  // without hydro forces it behaves as a second collisionless species
+#if SHOCK_TUBE
+  init_shock_tube(r, v, a, u, du);
+#else
+  // for now gas shares the collisionless rotating disk initial condition
   for(nn=0; nn<NUM_PARTICLES; nn++) {
     r[nn*NUM_DIMS + 0] = NUM_CELLS*(double)(rand())/RAND_MAX;
     r[nn*NUM_DIMS + 1] = NUM_CELLS*(double)(rand())/RAND_MAX;
@@ -917,6 +1037,7 @@ int main(int argc, char *argv[])
 #endif
     du[nn] = 0.0;
   }
+#endif
   cs_max = 0.0;
   v_max = 0.0;
   
@@ -1091,6 +1212,7 @@ int main(int argc, char *argv[])
       }
     }
 
+#if GRAVITY
     // create rho to complex copy threads
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
@@ -1168,6 +1290,11 @@ int main(int argc, char *argv[])
       }
     }
     
+#else
+    // no gravity, the hydro step adds pressure acceleration onto zero
+    memset(a, 0, NUM_DIMS*NUM_PARTICLES*sizeof(double));
+#endif
+
     // gas pressure on the mesh and pressure acceleration on gas particles
     compute_gas_pressure(rho_species, press, du_mesh, gas_vel, &cs_max, &v_max);
 
@@ -1317,6 +1444,20 @@ int main(int argc, char *argv[])
     dt = DT;
     if((cs_max + v_max)*DT > CFL_TARGET) {
       dt = CFL_TARGET/(cs_max + v_max);
+    }
+
+    // stop at T_END, last step is shortened to land on it
+    if(T_END > 0.0) {
+      if(sim_time >= T_END - 1.0e-12) {
+#if SHOCK_TUBE
+	write_shock_tube_profile("shocktube.dat", rho_species, sim_time);
+#endif
+	printf("reached T_END at tt: %d t: %.6f\n", tt, sim_time);
+	done = 1;
+      }
+      else if(sim_time + dt > T_END) {
+	dt = T_END - sim_time;
+      }
     }
 
     // update time step variable
