@@ -82,6 +82,11 @@
 #ifndef T_END
 #define T_END 5.0
 #endif
+
+// pure APIC transfers
+#ifndef PIC_BLEND
+#define PIC_BLEND 1.0
+#endif
 #elif GAS_CLOUD
 // gamma = 2 (n = 1) polytropic cylinder in hydrostatic equilibrium for
 // lap(phi) = 4 pi G rho in 2D: P = K rho^2 gives 2K lap(rho) = -4 pi G rho,
@@ -106,6 +111,14 @@
 #define GRAVITY 1
 #ifndef T_END
 #define T_END 10.0
+#endif
+
+// FLIP blending without APIC: with APIC transfers the hot self-gravitating
+// cloud slowly builds grid scale velocity noise, most of it in the affine
+// momentum, that FLIP blending keeps small. The growth does not go away at
+// smaller time steps, it is a spatial instability not yet understood
+#ifndef APIC
+#define APIC 0
 #endif
 #else
 // star system formation: a self-gravitating gas disk around a protostar, no
@@ -138,13 +151,12 @@
 #define ISOTHERMAL 1
 #define CS_ISO (SD_ASPECT*SD_V_K)
 
-// FLIP blending toward the CIC mesh velocity does not conserve angular
-// momentum, it exerts a net torque on the disk proportional to the blend
-// fraction, so the disk uses weak blending: 0.02 loses ~0.25% of the angular
-// momentum per outer orbit while keeping particle velocity noise flat, no
-// blending conserves it exactly but the noise grows
+// pure APIC transfers: FLIP blending toward the CIC mesh velocity exerts a
+// net torque on the disk proportional to the blend fraction (0.02 loses
+// ~0.3% of the angular momentum per outer orbit), APIC keeps the rotation in
+// the affine velocity and loses ~0.05% per orbit, at the same particle noise
 #ifndef PIC_BLEND
-#define PIC_BLEND 0.02
+#define PIC_BLEND 1.0
 #endif
 
 #define NUM_DM_PARTICLES 1
@@ -211,15 +223,42 @@
 #define RHO_ACC_EDGE 0.5
 
 // von Neumann-Richtmyer artificial viscosity, linear and quadratic terms,
-// applied in converging flow only
+// applied in converging flow only. It acts through the cell faces with the
+// velocity jump across the face, a compact difference that also damps the
+// odd-even velocity mode the central difference pressure force cannot see
+// and APIC transfers do not filter
 #define Q_LIN 0.5
 #define Q_QUAD 2.0
 
 // FLIP/PIC blending: each step gas particle velocities relax by this fraction
 // towards the mass weighted mesh velocity, 0 is pure FLIP (particles keep
-// their own velocities), 1 is pure PIC; damps sub-cell particle noise
+// their own velocities), 1 is pure PIC (pure APIC with APIC transfers);
+// damps sub-cell particle noise
 #ifndef PIC_BLEND
 #define PIC_BLEND 0.15
+#endif
+
+// APIC affine particle-in-cell transfers (Jiang et al. 2015): gas particles
+// carry an affine velocity matrix B, the momentum deposit adds the particle's
+// linear velocity field, m B grad(w), and the blend relaxes B towards the
+// mesh value sum_c w V_c (x_c - x_p)^T by the same fraction as the velocity.
+// Linear flows such as shear and rotation are then transferred without loss
+// and the angular momentum sum m x_p x v_p + m (B_yx - B_xy) is conserved
+// exactly for any blend fraction. Between blends B is not evolved, so it
+// lags the flow for small blend fractions: use APIC with PIC_BLEND 1 (pure
+// APIC) or close to it
+#ifndef APIC
+#define APIC 1
+#endif
+
+// the affine deposit m B grad(w) does not vanish with the CIC weight w, so a
+// node that receives only a small weight from a lone particle gets a velocity
+// mom/rho far beyond the flow. Where the sparsest node of a particle's stencil
+// holds less than APIC_SPARSE particle masses its B is scaled down by
+// rho_min/(APIC_SPARSE m). The B grad(w) terms of a particle sum to zero, so
+// momentum and energy stay exact, only the spin of near-empty regions is lost
+#ifndef APIC_SPARSE
+#define APIC_SPARSE 4.0
 #endif
 
 // return the kinetic energy removed by PIC blending to internal energy
@@ -514,11 +553,12 @@ void *compute_rho_field_thread(void *threadarg){
   // thread variables
   int ii,jj,kk;
   int s;
-  double *r, *v, *u, *sub_rho, *rho;
-  double *e_gas, *mx_gas, *my_gas;
+  double *r, *v, *u, *aff, *sub_rho, *rho;
+  double *e_gas, *mx_gas, *my_gas, *ax_gas, *ay_gas;
   double dr[2];
-  double w[4];
+  double w[4], gw[4][2], d[4][2];
   double mass;
+  const double *bp;
   int c[4];
 
   // thread data pointer
@@ -533,6 +573,7 @@ void *compute_rho_field_thread(void *threadarg){
   r=my_data->r;
   v=my_data->v;
   u=my_data->u;
+  aff=my_data->aff;
   sub_rho=my_data->rho;
 
   thread_id=my_data->thread_id;
@@ -541,6 +582,8 @@ void *compute_rho_field_thread(void *threadarg){
   e_gas=&sub_rho[(FIELD_GAS_ENERGY*NUM_THREADS + thread_id)*NUM_CELLS*NUM_CELLS];
   mx_gas=&sub_rho[(FIELD_GAS_MOM_X*NUM_THREADS + thread_id)*NUM_CELLS*NUM_CELLS];
   my_gas=&sub_rho[(FIELD_GAS_MOM_Y*NUM_THREADS + thread_id)*NUM_CELLS*NUM_CELLS];
+  ax_gas=&sub_rho[(FIELD_GAS_AFF_X*NUM_THREADS + thread_id)*NUM_CELLS*NUM_CELLS];
+  ay_gas=&sub_rho[(FIELD_GAS_AFF_Y*NUM_THREADS + thread_id)*NUM_CELLS*NUM_CELLS];
 
   // deposit each species into its own per-thread subfield
   for(s=0; s<NUM_SPECIES; s++) {
@@ -558,26 +601,28 @@ void *compute_rho_field_thread(void *threadarg){
       dr[0] = r[nn*NUM_DIMS + 0] - (double)(ii);
       dr[1] = r[nn*NUM_DIMS + 1] - (double)(jj);
 
-      c[0] = jj*NUM_CELLS + ii;
-      c[1] = jj*NUM_CELLS + modulo(ii+1, NUM_CELLS);
-      c[2] = modulo(jj+1, NUM_CELLS)*NUM_CELLS + ii;
-      c[3] = modulo(jj+1, NUM_CELLS)*NUM_CELLS + modulo(ii+1, NUM_CELLS);
-
-      w[0] = (1.0 - dr[0])*(1.0 - dr[1])*mass;
-      w[1] = (dr[0])*(1.0 - dr[1])*mass;
-      w[2] = (1.0 - dr[0])*(dr[1])*mass;
-      w[3] = (dr[0])*(dr[1])*mass;
+      cic_stencil(ii, jj, dr, NUM_CELLS, c, w, gw, d);
+      for(kk=0; kk<4; kk++) {
+	w[kk] *= mass;
+      }
 
       for(kk=0; kk<4; kk++) {
 	rho[c[kk]] += w[kk];
       }
 
-      // gas also deposits internal energy and momentum
+      // gas also deposits internal energy and momentum, with APIC the
+      // momentum of the particle's affine velocity field m B grad(w) goes
+      // to separate fields
       if(s == SPECIES_GAS) {
+	bp = &aff[4*(nn - species[SPECIES_GAS].offset)];
 	for(kk=0; kk<4; kk++) {
 	  e_gas[c[kk]] += w[kk]*u[nn - species[SPECIES_GAS].offset];
 	  mx_gas[c[kk]] += w[kk]*v[nn*NUM_DIMS + 0];
 	  my_gas[c[kk]] += w[kk]*v[nn*NUM_DIMS + 1];
+	  if(APIC) {
+	    ax_gas[c[kk]] += mass*(bp[0]*gw[kk][0] + bp[1]*gw[kk][1]);
+	    ay_gas[c[kk]] += mass*(bp[2]*gw[kk][0] + bp[3]*gw[kk][1]);
+	  }
 	}
       }
     }
@@ -656,6 +701,26 @@ static inline double face_lambda(double rho_i, double rho_j){
   return fmin(1.0, fmin(rho_i, rho_j)/(RHO_ACC_EDGE*0.5*(rho_i + rho_j)));
 }
 
+// artificial viscous pressure of the face between cells i and j with
+// densities rho_i, rho_j, thermal pressures p_i, p_j and normal velocity jump
+// dv = v_j - v_i, nonzero in compression only, symmetric under exchanging
+// the cells so both cells see the same value
+static inline double face_q(double rho_i, double rho_j, double p_i, double p_j, double dv){
+  double cs;
+
+  if(dv >= 0.0) {
+    return 0.0;
+  }
+#if ISOTHERMAL
+  cs = CS_ISO;
+  (void)p_i;
+  (void)p_j;
+#else
+  cs = sqrt(fmax(GAMMA*(p_i + p_j)/(rho_i + rho_j), 0.0));
+#endif
+  return 0.5*(rho_i + rho_j)*(Q_LIN*cs*(-dv) + Q_QUAD*dv*dv);
+}
+
 // compute gas pressure including artificial viscosity, the face pressure
 // acceleration and the matching specific internal energy rate on the mesh,
 // returns maximum sound speed and velocity and the residual of the discrete
@@ -663,31 +728,46 @@ static inline double face_lambda(double rho_i, double rho_j){
 void compute_gas_pressure(const double *grid_fields, double *press, double *du_mesh, double *vel, double *acc, double *cs_max, double *v_max, double *p_res){
   int ii, jj, nn;
   int nxp, nxm, nyp, nym;
-  double rho, cs2, divv, q, vabs;
+  double rho, cs2, vabs;
   double l_xm, l_xp, l_ym, l_yp;
+  double q_xm, q_xp, q_ym, q_yp;
+  double dv_xm, dv_xp, dv_ym, dv_yp;
 
   const double *rho_gas = &grid_fields[FIELD_RHO_GAS*NUM_CELLS*NUM_CELLS];
   const double *e_gas = &grid_fields[FIELD_GAS_ENERGY*NUM_CELLS*NUM_CELLS];
   const double *mx_gas = &grid_fields[FIELD_GAS_MOM_X*NUM_CELLS*NUM_CELLS];
   const double *my_gas = &grid_fields[FIELD_GAS_MOM_Y*NUM_CELLS*NUM_CELLS];
-  double *vx = &vel[0];
-  double *vy = &vel[NUM_CELLS*NUM_CELLS];
+  const double *affx_gas = &grid_fields[FIELD_GAS_AFF_X*NUM_CELLS*NUM_CELLS];
+  const double *affy_gas = &grid_fields[FIELD_GAS_AFF_Y*NUM_CELLS*NUM_CELLS];
+  // full mesh velocity (mom + affine)/rho for the blend and the CFL limit,
+  // and particle velocity part mom/rho for the viscosity and the face work
+  double *vfx = &vel[0];
+  double *vfy = &vel[NUM_CELLS*NUM_CELLS];
+  double *vx = &vel[2*NUM_CELLS*NUM_CELLS];
+  double *vy = &vel[3*NUM_CELLS*NUM_CELLS];
   double *ax = &acc[0];
   double *ay = &acc[NUM_CELLS*NUM_CELLS];
 
   *cs_max = 0.0;
   *v_max = 0.0;
 
-  // mass weighted mesh velocity and thermal pressure
+  // mass weighted mesh velocity and thermal pressure. The kick changes the
+  // particle velocities only, so the work of the face forces is taken with
+  // the particle velocity part of the mesh velocity, the APIC affine
+  // momentum receives no force and does no work
   for(nn=0; nn<NUM_CELLS*NUM_CELLS; nn++) {
     rho = rho_gas[nn];
     if(rho > 0.0) {
       vx[nn] = mx_gas[nn]/rho;
       vy[nn] = my_gas[nn]/rho;
+      vfx[nn] = (mx_gas[nn] + affx_gas[nn])/rho;
+      vfy[nn] = (my_gas[nn] + affy_gas[nn])/rho;
     }
     else {
       vx[nn] = 0.0;
       vy[nn] = 0.0;
+      vfx[nn] = 0.0;
+      vfy[nn] = 0.0;
     }
 
     if(rho > RHO_GAS_FLOOR) {
@@ -703,49 +783,26 @@ void compute_gas_pressure(const double *grid_fields, double *press, double *du_m
     }
   }
 
-  // velocity divergence and artificial viscosity
-  for(jj=0; jj<NUM_CELLS; jj++) {
-    for(ii=0; ii<NUM_CELLS; ii++) {
-      nn = jj*NUM_CELLS + ii;
-      rho = rho_gas[nn];
+  // maximum sound speed and velocity of the gas
+  for(nn=0; nn<NUM_CELLS*NUM_CELLS; nn++) {
+    rho = rho_gas[nn];
 
-      if(rho <= RHO_GAS_FLOOR) {
-	continue;
-      }
-
-      // central difference divergence, empty neighbors take the velocity of
-      // this cell so the gas edge does not show up as spurious compression
-      nxp = jj*NUM_CELLS + modulo(ii+1, NUM_CELLS);
-      nxm = jj*NUM_CELLS + modulo(ii-1, NUM_CELLS);
-      nyp = modulo(jj+1, NUM_CELLS)*NUM_CELLS + ii;
-      nym = modulo(jj-1, NUM_CELLS)*NUM_CELLS + ii;
-
-      divv = 0.5*(((rho_gas[nxp] > RHO_GAS_FLOOR) ? vx[nxp] : vx[nn]) -
-		  ((rho_gas[nxm] > RHO_GAS_FLOOR) ? vx[nxm] : vx[nn])) +
-	0.5*(((rho_gas[nyp] > RHO_GAS_FLOOR) ? vy[nyp] : vy[nn]) -
-	     ((rho_gas[nym] > RHO_GAS_FLOOR) ? vy[nym] : vy[nn]));
+    if(rho <= RHO_GAS_FLOOR) {
+      continue;
+    }
 
 #if ISOTHERMAL
-      cs2 = CS_ISO*CS_ISO;
+    cs2 = CS_ISO*CS_ISO;
 #else
-      cs2 = GAMMA*press[nn]/rho;
+    cs2 = GAMMA*press[nn]/rho;
 #endif
 
-      if(cs2 > *cs_max) {
-	*cs_max = cs2;
-      }
-      vabs = vx[nn]*vx[nn] + vy[nn]*vy[nn];
-      if(vabs > *v_max) {
-	*v_max = vabs;
-      }
-
-      // viscous pressure in converging flow, cell size is 1
-      q = 0.0;
-      if(divv < 0.0) {
-	q = rho*(Q_LIN*sqrt(cs2)*(-divv) + Q_QUAD*divv*divv);
-      }
-
-      press[nn] += q;
+    if(cs2 > *cs_max) {
+      *cs_max = cs2;
+    }
+    vabs = vfx[nn]*vfx[nn] + vfy[nn]*vfy[nn];
+    if(vabs > *v_max) {
+      *v_max = vabs;
     }
   }
 
@@ -777,11 +834,23 @@ void compute_gas_pressure(const double *grid_fields, double *press, double *du_m
       l_ym = face_lambda(rho_gas[nym], rho);
       l_yp = face_lambda(rho, rho_gas[nyp]);
 
-      ax[nn] = 0.5*(l_xm*(press[nxm] + press[nn]) - l_xp*(press[nn] + press[nxp]))/rho;
-      ay[nn] = 0.5*(l_ym*(press[nym] + press[nn]) - l_yp*(press[nn] + press[nyp]))/rho;
+      dv_xm = vx[nn] - vx[nxm];
+      dv_xp = vx[nxp] - vx[nn];
+      dv_ym = vy[nn] - vy[nym];
+      dv_yp = vy[nyp] - vy[nn];
 
-      du_mesh[nn] = -0.5*press[nn]*(l_xp*(vx[nxp] - vx[nn]) + l_xm*(vx[nn] - vx[nxm]) +
-				    l_yp*(vy[nyp] - vy[nn]) + l_ym*(vy[nn] - vy[nym]))/rho;
+      q_xm = face_q(rho_gas[nxm], rho, press[nxm], press[nn], dv_xm);
+      q_xp = face_q(rho, rho_gas[nxp], press[nn], press[nxp], dv_xp);
+      q_ym = face_q(rho_gas[nym], rho, press[nym], press[nn], dv_ym);
+      q_yp = face_q(rho, rho_gas[nyp], press[nn], press[nyp], dv_yp);
+
+      ax[nn] = (l_xm*(0.5*(press[nxm] + press[nn]) + q_xm) - l_xp*(0.5*(press[nn] + press[nxp]) + q_xp))/rho;
+      ay[nn] = (l_ym*(0.5*(press[nym] + press[nn]) + q_ym) - l_yp*(0.5*(press[nn] + press[nyp]) + q_yp))/rho;
+
+      // thermal face work split in proportion to the cell pressures, the
+      // viscous face work equally between the two cells
+      du_mesh[nn] = -0.5*(l_xp*(press[nn] + q_xp)*dv_xp + l_xm*(press[nn] + q_xm)*dv_xm +
+			  l_yp*(press[nn] + q_yp)*dv_yp + l_ym*(press[nn] + q_ym)*dv_ym)/rho;
     }
   }
 
@@ -807,7 +876,11 @@ void *hydro_interpolation_thread(void *threadarg){
   double dr[2];
   double w[4];
   int c[4];
-  double vpx, vpy, wx, wy, var, v2, h;
+  double vpx, vpy, wx, wy, var, v2, h, bc;
+  double gw[4][2], d[4][2], bg[4], cg[4];
+  double *aff, *bp;
+  const double *rho_gas;
+  double rho_min, sparse;
   double flip_loss = 0.0;
 
   struct thread_data *my_data;
@@ -825,6 +898,8 @@ void *hydro_interpolation_thread(void *threadarg){
   vx=&my_data->vel_mesh[0];
   vy=&my_data->vel_mesh[NUM_CELLS*NUM_CELLS];
   du_mesh=my_data->du_mesh;
+  aff=my_data->aff;
+  rho_gas=&my_data->grid_fields[FIELD_RHO_GAS*NUM_CELLS*NUM_CELLS];
 
   thread_id=my_data->thread_id;
 
@@ -847,18 +922,13 @@ void *hydro_interpolation_thread(void *threadarg){
     du[gg] = cic_interp(du_mesh, ii, jj, dr, NUM_CELLS);
 
     if(PIC_BLEND > 0.0) {
-      c[0] = jj*NUM_CELLS + ii;
-      c[1] = jj*NUM_CELLS + modulo(ii+1, NUM_CELLS);
-      c[2] = modulo(jj+1, NUM_CELLS)*NUM_CELLS + ii;
-      c[3] = modulo(jj+1, NUM_CELLS)*NUM_CELLS + modulo(ii+1, NUM_CELLS);
+      cic_stencil(ii, jj, dr, NUM_CELLS, c, w, gw, d);
+      bp = &aff[4*gg];
 
-      w[0] = (1.0 - dr[0])*(1.0 - dr[1]);
-      w[1] = (dr[0])*(1.0 - dr[1]);
-      w[2] = (1.0 - dr[0])*(dr[1]);
-      w[3] = (dr[0])*(dr[1]);
-
-      // mass weighted mesh velocity V at the particle and its CIC weighted
-      // variance over the four cells
+      // mass weighted mesh velocity V at the particle, its CIC weighted
+      // variance over the four cells, the mesh velocity gradient
+      // C_ab = sum_c V_c,a dw_c/dx_b and the APIC matrix of the mesh
+      // velocity B^g_ab = sum_c w_c V_c,a (x_c - x_p)_b
       vpx = 0.0;
       vpy = 0.0;
       for(kk=0; kk<4; kk++) {
@@ -868,6 +938,32 @@ void *hydro_interpolation_thread(void *threadarg){
       var = 0.0;
       for(kk=0; kk<4; kk++) {
 	var += w[kk]*((vx[c[kk]] - vpx)*(vx[c[kk]] - vpx) + (vy[c[kk]] - vpy)*(vy[c[kk]] - vpy));
+      }
+      bc = 0.0;
+      if(APIC) {
+	bg[0] = bg[1] = bg[2] = bg[3] = 0.0;
+	cg[0] = cg[1] = cg[2] = cg[3] = 0.0;
+	for(kk=0; kk<4; kk++) {
+	  bg[0] += w[kk]*vx[c[kk]]*d[kk][0];
+	  bg[1] += w[kk]*vx[c[kk]]*d[kk][1];
+	  bg[2] += w[kk]*vy[c[kk]]*d[kk][0];
+	  bg[3] += w[kk]*vy[c[kk]]*d[kk][1];
+	  cg[0] += vx[c[kk]]*gw[kk][0];
+	  cg[1] += vx[c[kk]]*gw[kk][1];
+	  cg[2] += vy[c[kk]]*gw[kk][0];
+	  cg[3] += vy[c[kk]]*gw[kk][1];
+	}
+	// B : C with the B that was deposited
+	bc = bp[0]*cg[0] + bp[1]*cg[1] + bp[2]*cg[2] + bp[3]*cg[3];
+	rho_min = rho_gas[c[0]];
+	for(kk=1; kk<4; kk++) {
+	  rho_min = fmin(rho_min, rho_gas[c[kk]]);
+	}
+	sparse = fmin(1.0, rho_min/(APIC_SPARSE*species[SPECIES_GAS].mass));
+	for(kk=0; kk<4; kk++) {
+	  bp[kk] += PIC_BLEND*(bg[kk] - bp[kk]);
+	  bp[kk] *= sparse;
+	}
       }
 
       // velocity relative to the mesh velocity, blended by a = PIC_BLEND
@@ -880,14 +976,16 @@ void *hydro_interpolation_thread(void *threadarg){
       flip_loss += 0.5*(v2 - v[nn*NUM_DIMS + 0]*v[nn*NUM_DIMS + 0] - v[nn*NUM_DIMS + 1]*v[nn*NUM_DIMS + 1]);
 
       // the removed kinetic energy becomes heat. Per particle the blend removes
-      // a(2-a)/2 |w|^2 + a V.w, summed over particles the second term is
-      // a (sum_c rho_c |V_c|^2 - sum_p m |V_p|^2) because V_c = mom_c/rho_c,
-      // which equals a sum_p m var_p. Heating each particle by
-      // a(2-a)/2 |w|^2 + a var_p returns exactly the kinetic energy removed
-      // with a local, Galilean invariant and non-negative heat
+      // a(2-a)/2 |w|^2 + a V.w. Because V_c = mom_c/rho_c and the deposit
+      // carried m (w v_p + B grad(w)), summed over particles the second term
+      // is a sum_p m (var_p - B:C_p), so heating each particle by
+      // a(2-a)/2 |w|^2 + a (var_p - B:C_p) returns exactly the kinetic energy
+      // removed with a local and Galilean invariant heat. Without APIC B = 0
+      // and the heat is non-negative, with APIC var_p - B:C_p vanishes for a
+      // linear velocity field, so resolved shear is not dissipated
       if(PIC_BLEND_HEAT && !ISOTHERMAL) {
-	h = 0.5*PIC_BLEND*(2.0 - PIC_BLEND)*(wx*wx + wy*wy) + PIC_BLEND*var;
-	u[gg] += h;
+	h = 0.5*PIC_BLEND*(2.0 - PIC_BLEND)*(wx*wx + wy*wy) + PIC_BLEND*(var - bc);
+	u[gg] = fmax(u[gg] + h, U_MIN);
 	flip_loss -= h;
       }
     }
@@ -1065,8 +1163,8 @@ double set_equilibrium_rotation(double *r, double *v, const double *a){
 // radial profile of the gas disk around the star in bins of one cell:
 // surface density, mean azimuthal and radial velocity relative to the star
 // and the rms radial velocity, header with the star state and the total
-// angular momentum about the center of mass
-void write_star_disk_profile(FILE *fp, const double *r, const double *v, double t){
+// angular momentum about the center of mass including the APIC spin
+void write_star_disk_profile(FILE *fp, const double *r, const double *v, const double *aff, double t){
   int nn, bb;
   int ns = species[SPECIES_DM].offset;
   double cx = r[ns*NUM_DIMS + 0], cy = r[ns*NUM_DIMS + 1];
@@ -1097,6 +1195,8 @@ void write_star_disk_profile(FILE *fp, const double *r, const double *v, double 
     if(nn < species[SPECIES_GAS].offset) {
       continue;
     }
+    // APIC spin angular momentum of the particle's affine velocity field
+    lz += m*(aff[4*(nn - species[SPECIES_GAS].offset) + 2] - aff[4*(nn - species[SPECIES_GAS].offset) + 1]);
     dx = r[nn*NUM_DIMS + 0] - cx;
     dy = r[nn*NUM_DIMS + 1] - cy;
     dvx = v[nn*NUM_DIMS + 0] - svx;
@@ -1311,6 +1411,7 @@ void write_shock_tube_profile(const char *path, const double *grid_fields, doubl
   const double *rho_gas = &grid_fields[FIELD_RHO_GAS*NUM_CELLS*NUM_CELLS];
   const double *e_gas = &grid_fields[FIELD_GAS_ENERGY*NUM_CELLS*NUM_CELLS];
   const double *mx_gas = &grid_fields[FIELD_GAS_MOM_X*NUM_CELLS*NUM_CELLS];
+  const double *affx_gas = &grid_fields[FIELD_GAS_AFF_X*NUM_CELLS*NUM_CELLS];
   double p_r = (GAMMA - 1.0)*ST_RHO_R*ST_U_R;
 
   fp = fopen(path, "w");
@@ -1332,7 +1433,7 @@ void write_shock_tube_profile(const char *path, const double *grid_fields, doubl
     for(jj=0; jj<NUM_CELLS; jj++) {
       nn = jj*NUM_CELLS + ii;
       rho += rho_gas[nn];
-      mx += mx_gas[nn];
+      mx += mx_gas[nn] + affx_gas[nn];
       e += e_gas[nn];
     }
     // mesh nodes sit at integer coordinates
@@ -1374,7 +1475,7 @@ int main(int argc, char *argv[])
 
   
   double *rho, *sub_rho, *rho_species;
-  double *u, *du;
+  double *u, *du, *aff;
   double *press, *du_mesh, *gas_vel, *gas_acc;
   double cs_max, v_max, e_thermal;
   double p_res, e_flip_loss = 0.0, e_work_res = 0.0;
@@ -1479,14 +1580,15 @@ int main(int argc, char *argv[])
   // gas internal energy and its time derivative
   u=(double *)malloc(NUM_GAS_PARTICLES*sizeof(double));
   du=(double *)malloc(NUM_GAS_PARTICLES*sizeof(double));
-  if(!u || !du){
+  aff=(double *)calloc(4*(NUM_GAS_PARTICLES > 0 ? NUM_GAS_PARTICLES : 1), sizeof(double));
+  if(!u || !du || !aff){
     printf("Out of memory: u or du not allocated.\n");
     exit(1);
   }
   // gas pressure, du/dt and mesh velocity
   press=(double *)malloc(NUM_CELLS*NUM_CELLS*sizeof(double));
   du_mesh=(double *)malloc(NUM_CELLS*NUM_CELLS*sizeof(double));
-  gas_vel=(double *)malloc(2*NUM_CELLS*NUM_CELLS*sizeof(double));
+  gas_vel=(double *)malloc(4*NUM_CELLS*NUM_CELLS*sizeof(double));
   gas_acc=(double *)malloc(2*NUM_CELLS*NUM_CELLS*sizeof(double));
   if(!press || !du_mesh || !gas_vel || !gas_acc){
     printf("Out of memory: gas pressure fields not allocated.\n");
@@ -1703,6 +1805,7 @@ int main(int argc, char *argv[])
       thread_data_array[nn].r=r;
       thread_data_array[nn].v=v;
       thread_data_array[nn].u=u;
+      thread_data_array[nn].aff=aff;
       thread_data_array[nn].rho=sub_rho;
 
       thread_rc=pthread_create(&threads[nn], &attr, compute_rho_field_thread, (void *) &thread_data_array[nn]);
@@ -1835,6 +1938,7 @@ int main(int argc, char *argv[])
       thread_data_array[nn].acc_mesh=gas_acc;
       thread_data_array[nn].vel_mesh=gas_vel;
       thread_data_array[nn].du_mesh=du_mesh;
+      thread_data_array[nn].aff=aff;
     }
     run_threads(hydro_interpolation_thread);
     for(nn=0;nn<NUM_THREADS;nn++){
@@ -1879,7 +1983,7 @@ int main(int argc, char *argv[])
       v_max = set_equilibrium_rotation(r, v, a);
       setup_pass = 0;
       dt = fmin(DT, CFL_TARGET/(cs_max + v_max));
-      write_star_disk_profile(disk_fp, r, v, 0.0);
+      write_star_disk_profile(disk_fp, r, v, aff, 0.0);
       continue;
     }
 #endif
@@ -2008,7 +2112,7 @@ int main(int argc, char *argv[])
 
 #if STAR_DISK
     if(sim_time >= next_disk_out - 1.0e-12) {
-      write_star_disk_profile(disk_fp, r, v, sim_time);
+      write_star_disk_profile(disk_fp, r, v, aff, sim_time);
       next_disk_out += SD_OUT_DT;
     }
     if(sim_time + dt > next_disk_out) {

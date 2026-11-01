@@ -39,6 +39,8 @@ enum grid_field_id{
   FIELD_GAS_ENERGY = NUM_SPECIES,  // gas internal energy density, sum of m*u
   FIELD_GAS_MOM_X,                 // gas momentum density, sum of m*v_x
   FIELD_GAS_MOM_Y,                 // gas momentum density, sum of m*v_y
+  FIELD_GAS_AFF_X,                 // APIC affine momentum, sum of m*(B grad(w))_x
+  FIELD_GAS_AFF_Y,                 // APIC affine momentum, sum of m*(B grad(w))_y
   NUM_GRID_FIELDS
 };
 
@@ -71,8 +73,14 @@ struct thread_data{
   double *u;
   double *du;
 
+  // APIC affine velocity matrix of each gas particle, B[4*g + 2*a + b] holds
+  // B_ab = sum_c w_c V_c,a (x_c - x_p)_b, the particle velocity field around
+  // x_p is v_p + B D^-1 (x - x_p) with D = sum_c w_c (x_c - x_p)(x_c - x_p)^T
+  double *aff;
+
   // summed mesh fields, gas pressure acceleration, mass weighted gas
-  // velocity and specific internal energy rate on the mesh
+  // velocity including the APIC affine momentum (first two of the four
+  // velocity components) and specific internal energy rate on the mesh
   double *grid_fields;
   double *acc_mesh;
   double *vel_mesh;
@@ -117,6 +125,35 @@ static inline double wrap_periodic(double x, double L){
     x = 0.0;
   }
   return x;
+}
+
+// cloud in cell stencil of a particle at offset dr inside cell (ii, jj): the
+// four node indices, weights w, weight gradients gw and node offsets
+// d = x_c - x_p, nodes ordered (ii, jj), (ii+1, jj), (ii, jj+1), (ii+1, jj+1)
+static inline void cic_stencil(int ii, int jj, const double *dr, int n,
+			       int *c, double *w, double gw[4][2], double d[4][2]){
+  int ip = modulo(ii+1, n);
+  int jp = modulo(jj+1, n);
+
+  c[0] = jj*n + ii;
+  c[1] = jj*n + ip;
+  c[2] = jp*n + ii;
+  c[3] = jp*n + ip;
+
+  w[0] = (1.0 - dr[0])*(1.0 - dr[1]);
+  w[1] = (dr[0])*(1.0 - dr[1]);
+  w[2] = (1.0 - dr[0])*(dr[1]);
+  w[3] = (dr[0])*(dr[1]);
+
+  gw[0][0] = -(1.0 - dr[1]); gw[0][1] = -(1.0 - dr[0]);
+  gw[1][0] = (1.0 - dr[1]);  gw[1][1] = -dr[0];
+  gw[2][0] = -dr[1];         gw[2][1] = (1.0 - dr[0]);
+  gw[3][0] = dr[1];          gw[3][1] = dr[0];
+
+  d[0][0] = -dr[0];       d[0][1] = -dr[1];
+  d[1][0] = 1.0 - dr[0];  d[1][1] = -dr[1];
+  d[2][0] = -dr[0];       d[2][1] = 1.0 - dr[1];
+  d[3][0] = 1.0 - dr[0];  d[3][1] = 1.0 - dr[1];
 }
 
 // cloud in cell interpolation of a periodic field f to offset dr inside cell (ii, jj)
