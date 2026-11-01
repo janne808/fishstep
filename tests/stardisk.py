@@ -113,7 +113,7 @@ def main():
 
     print(f"protostellar disk: disk/star mass {m0['disk_to_star']:g}, R {r_in:g} - {r_out:g} cells, "
           f"outer orbit {t_orb:.2f}, gamma {m0['gamma']:.3f}, Q_init {m0['Q_init']:g}, "
-          + (f"beta cooling {m0['beta']:g} to u_floor {m0['u_floor']:g}" if m0["cooling"] else "no cooling"))
+          + (f"beta cooling {m0['beta']:g} to the irradiation floor, Q_floor {m0['Q_floor']:g}" if m0["cooling"] else "no cooling"))
     print("   t  orbits(R_out)  sigma L1   <v_r>/cs   Q min   Q median   E_th/E_th0  E_rad/E_th0  "
           "M_acc/M_disk  Lz/Lz0-1   clumps  clump mass  largest")
     lz0 = m0["Lz"]

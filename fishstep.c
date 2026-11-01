@@ -137,10 +137,14 @@
 // symmetry of the box on the disk. With the 2D log potential of the other
 // test problems a rotating disk cannot fragment, kappa^2 > 4 pi G sigma always.
 //
-// The gas is an ideal gas started at Toomre Q = cs kappa/(pi G sigma) =
-// SD_Q_INIT and cooled on beta cooling times t_cool = SD_BETA/Omega towards
-// a floor temperature SD_U_FLOOR times the initial one, standing in for
-// stellar irradiation. Fast cooling (SD_BETA of a few) lets Q fall below ~1,
+// The gas is an ideal gas cooled on beta cooling times t_cool = SD_BETA/Omega
+// towards the temperature that stellar irradiation keeps it at, a function of
+// radius only: cs_floor ~ r^(-1/4) (T ~ r^(-1/2)), normalized to Toomre
+// Q = cs kappa/(pi G sigma) = SD_Q_FLOOR in the middle of the disk. With
+// sigma ~ 1/r the floor Q falls as r^(-3/4), so the outer disk can fragment
+// while the inner disk stays marginal and the thin outer taper stays warm and
+// stable. The gas starts at Q = SD_Q_INIT but not below the floor
+// temperature. Fast cooling (SD_BETA of a few) lets Q fall below ~1,
 // the disk breaks up into spiral arms and bound gas clumps collapse out of
 // them; slow cooling heats the disk by gravitational turbulence instead
 // (Gammie 2001). The rotation is put into equilibrium from the gravity and
@@ -178,8 +182,8 @@
 #ifndef SD_BETA
 #define SD_BETA 2.0
 #endif
-#ifndef SD_U_FLOOR
-#define SD_U_FLOOR 0.1
+#ifndef SD_Q_FLOOR
+#define SD_Q_FLOOR 0.5
 #endif
 
 // gas within SD_R_ACC cells of the star is accreted onto it
@@ -1086,9 +1090,11 @@ static double star_disk_sigma(double rr){
 #define SD_R_MAX (SD_R_OUT + 6.0*SD_EDGE_OUT)
 #define SD_NUM_TAB 8192
 
-// initial specific internal energy and orbital frequency on the radius grid
+// initial and irradiation floor specific internal energy and orbital
+// frequency on the radius grid
 // rr = SD_R_MAX k/SD_NUM_TAB, k = 0..SD_NUM_TAB, set by init_star_disk
 static double sd_u_tab[SD_NUM_TAB + 1];
+static double sd_ufloor_tab[SD_NUM_TAB + 1];
 static double sd_omega_tab[SD_NUM_TAB + 1];
 
 // linear interpolation of a radius grid table, constant beyond its ends
@@ -1124,12 +1130,16 @@ static double sd_uniform(unsigned long long *state){
 // later by set_equilibrium_rotation. The temperature is
 // set for Toomre Q = SD_Q_INIT from the Keplerian estimates
 // Omega^2 = G M(<r)/r^3 and kappa^2 = Omega^2 + 2 pi G sigma/r of the
-// enclosed star and disk mass, softened like the mesh gravity
+// enclosed star and disk mass, softened like the mesh gravity, but not
+// below the irradiation floor, cs_floor ~ r^(-1/4) with Q = SD_Q_FLOOR at
+// the middle of the disk
 void init_star_disk(double *r, double *v, double *a, double *u, double *du){
   int nn, gg, kk;
-  double rr, q, th, f, sigma, menc, s3, om2, kap2, cs;
+  double rr, q, th, f, sigma, menc, s3, om2, kap2, cs, cs_ref, r_ref;
   unsigned long long seed = 0x9e3779b97f4a7c15ULL;
   static double rad_tab[SD_NUM_TAB + 1], cdf_tab[SD_NUM_TAB + 1];
+  // pi G sigma/kappa, the sound speed of Q = 1
+  static double qcs_tab[SD_NUM_TAB + 1];
 
   // enclosed mass table, sigma ~ 1/r vanishes towards r = 0 through the taper
   rad_tab[0] = 0.0;
@@ -1148,9 +1158,17 @@ void init_star_disk(double *r, double *v, double *a, double *u, double *du){
     s3 = pow(rr*rr + SD_SOFT*SD_SOFT, 1.5);
     om2 = G_DISK*menc/s3;
     kap2 = om2 + 2.0*M_PI*G_DISK*sigma*rr*rr/s3;
-    cs = SD_Q_INIT*M_PI*G_DISK*sigma/sqrt(kap2);
+    qcs_tab[kk] = M_PI*G_DISK*sigma/sqrt(kap2);
     sd_omega_tab[kk] = sqrt(om2);
-    sd_u_tab[kk] = fmax(cs*cs/(GAMMA*(GAMMA - 1.0)), U_MIN);
+  }
+  r_ref = 0.5*(SD_R_IN + SD_R_OUT);
+  cs_ref = SD_Q_FLOOR*sd_lookup(qcs_tab, r_ref);
+  for(kk=0; kk<=SD_NUM_TAB; kk++) {
+    // the floor is held constant inside the accretion radius
+    cs = cs_ref*pow(fmax(rad_tab[kk], SD_R_ACC)/r_ref, -0.25);
+    sd_ufloor_tab[kk] = cs*cs/(GAMMA*(GAMMA - 1.0));
+    cs = SD_Q_INIT*qcs_tab[kk];
+    sd_u_tab[kk] = fmax(fmax(cs*cs/(GAMMA*(GAMMA - 1.0)), sd_ufloor_tab[kk]), U_MIN);
   }
 
   for(nn=0; nn<NUM_PARTICLES; nn++) {
@@ -1202,7 +1220,7 @@ double cool_star_disk(const double *r, double *u, const unsigned char *sink, dou
     dx = r[nn*NUM_DIMS + 0] - cx;
     dy = r[nn*NUM_DIMS + 1] - cy;
     rr = sqrt(dx*dx + dy*dy);
-    u_floor = SD_U_FLOOR*sd_lookup(sd_u_tab, rr);
+    u_floor = sd_lookup(sd_ufloor_tab, rr);
     u_new = u_floor + (u[gg] - u_floor)*exp(-dt*sd_lookup(sd_omega_tab, rr)/SD_BETA);
     u_new = fmax(u_new, U_MIN);
     e_rad += u[gg] - u_new;
@@ -1422,9 +1440,9 @@ void write_star_disk_profile(FILE *fp, const double *r, const double *v, const d
   // in the middle of the disk
   fprintf(fp, "# t %.6f star_x %.6f star_y %.6f star_vx %.6e star_vy %.6e cm_x %.6f cm_y %.6f Lz %.10e "
 	  "R_in %.3f R_out %.3f edge_out %.3f v_K %.6f cs %.6f disk_to_star %.4f G %.6f gamma %.6f beta %.4f "
-	  "cooling %d Q_init %.4f u_floor %.4f E_th %.10e E_rad %.10e M_acc %.6e\n",
+	  "cooling %d Q_init %.4f Q_floor %.4f E_th %.10e E_rad %.10e M_acc %.6e\n",
 	  t, cx, cy, svx, svy, gx, gy, lz, SD_R_IN, SD_R_OUT, SD_EDGE_OUT, SD_V_K, sd_cs_init(0.5*(SD_R_IN + SD_R_OUT)),
-	  SD_DISK_TO_STAR, G_DISK, GAMMA, SD_BETA, SD_COOLING, SD_Q_INIT, SD_U_FLOOR, e_th, e_rad, m_acc);
+	  SD_DISK_TO_STAR, G_DISK, GAMMA, SD_BETA, SD_COOLING, SD_Q_INIT, SD_Q_FLOOR, e_th, e_rad, m_acc);
   for(bb=0; bb<NB; bb++) {
     if(mass[bb] > 0.0) {
       fprintf(fp, "%.2f %.8e %.6e %.6e %.6e %.6e\n", bb + 0.5, mass[bb]/(M_PI*(double)(2*bb + 1)),
@@ -1967,9 +1985,9 @@ int main(int argc, char *argv[])
     printf("Could not open stardisk.dat or stardisk_rho.bin for writing.\n");
     exit(1);
   }
-  printf("star disk: disk/star mass %.3f, R %.1f - %.1f cells, Q_init %.2f, cooling %d beta %.2f u_floor %.2f\n"
+  printf("star disk: disk/star mass %.3f, R %.1f - %.1f cells, Q_init %.2f, cooling %d beta %.2f Q_floor %.2f\n"
 	 "           cs %.4f and orbit %.4f at R_in, cs %.4f and orbit %.4f at R_out\n",
-	 SD_DISK_TO_STAR, SD_R_IN, SD_R_OUT, SD_Q_INIT, SD_COOLING, SD_BETA, SD_U_FLOOR,
+	 SD_DISK_TO_STAR, SD_R_IN, SD_R_OUT, SD_Q_INIT, SD_COOLING, SD_BETA, SD_Q_FLOOR,
 	 sd_cs_init(SD_R_IN + SD_EDGE_IN), 2.0*M_PI/sd_lookup(sd_omega_tab, SD_R_IN),
 	 sd_cs_init(SD_R_OUT), 2.0*M_PI/sd_lookup(sd_omega_tab, SD_R_OUT));
   dt = 0.0;
