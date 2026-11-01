@@ -147,7 +147,10 @@
 // target CFL number for the adaptive time step, gas signal speed*dt/cell
 #define CFL_TARGET 0.4
 
-#define G 4.0*M_PI*M_PI;
+// effective gravitational constant of the mesh solver: the density source is
+// scaled by 4 pi^2 and the unnormalized inverse FFT by 1/NUM_CELLS instead of
+// 1/NUM_CELLS^2, so the potential solves lap(phi) = 4 pi G_EFF rho with unit cell size
+#define G_EFF (M_PI*(double)(NUM_CELLS))
 
 struct thread_data thread_data_array[NUM_THREADS];
 
@@ -874,10 +877,9 @@ int main(int argc, char *argv[])
   double acc;
   int s;
   double *phi;
-  double *green;
   double *gr_hat;
 
-  double k_x, k_y;
+  double k_x, k_y, dd_k;
   
   fftw_complex *rho_hat, *green_rho_hat, *rho_complex, *phi_complex;
   fftw_plan rho_plan, phi_plan;
@@ -991,12 +993,6 @@ int main(int argc, char *argv[])
     printf("Out of memory: phi not allocated.\n");
     exit(1);
   }
-  // green's function
-  green=(double *)malloc((NUM_CELLS)*(NUM_CELLS)*sizeof(double));
-  if(!green){
-    printf("Out of memory: green not allocated.\n");
-    exit(1);
-  }
   gr_hat=(double *)malloc(NUM_CELLS*NUM_CELLS*sizeof(double));
   if(!gr_hat){
     printf("Out of memory: gr_hat not allocated.\n");
@@ -1073,17 +1069,16 @@ int main(int argc, char *argv[])
   cs_max = 0.0;
   v_max = 0.0;
   
-  // compute gravitational green's function in k-space
-  for(jj=0; jj<NUM_CELLS/2; jj++) {
-    for(ii=0; ii<NUM_CELLS/2; ii++) {
-      k_x = 2.0*M_PI*(ii+1)/(double)(NUM_CELLS);
-      k_y = 2.0*M_PI*(jj+1)/(double)(NUM_CELLS);
+  // compute gravitational green's function in k-space for the 5 point
+  // discrete laplacian, FFT bin ii holds wavenumber ii for ii <= N/2 and
+  // ii - N above, the k = 0 mean density mode is dropped (periodic box)
+  for(jj=0; jj<NUM_CELLS; jj++) {
+    for(ii=0; ii<NUM_CELLS; ii++) {
+      k_x = 2.0*M_PI*(double)(ii <= NUM_CELLS/2 ? ii : ii - NUM_CELLS)/(double)(NUM_CELLS);
+      k_y = 2.0*M_PI*(double)(jj <= NUM_CELLS/2 ? jj : jj - NUM_CELLS)/(double)(NUM_CELLS);
+      dd_k = sin(k_x/2.0)*sin(k_x/2.0) + sin(k_y/2.0)*sin(k_y/2.0);
 
-      green[jj*NUM_CELLS + ii] = -(1.0/4.0)*1.0/(sin(k_x/2.0)*sin(k_x/2.0)+sin(k_y/2.0)*sin(k_y/2.0));
-      gr_hat[jj*NUM_CELLS + ii] = green[jj*NUM_CELLS + ii];
-      gr_hat[jj*NUM_CELLS + (NUM_CELLS-ii-1)] = green[jj*NUM_CELLS + ii];
-      gr_hat[(NUM_CELLS-jj-1)*NUM_CELLS + (NUM_CELLS-ii-1)] = green[jj*NUM_CELLS + ii];      
-      gr_hat[(NUM_CELLS-jj-1)*NUM_CELLS + ii] = green[jj*NUM_CELLS + ii];      
+      gr_hat[jj*NUM_CELLS + ii] = (dd_k > 0.0) ? -(1.0/4.0)/dd_k : 0.0;
     }
   }
 
