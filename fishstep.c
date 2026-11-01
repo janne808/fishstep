@@ -50,10 +50,15 @@
 // number of cells per dimension
 #define NUM_CELLS 512
 
-// test problem, 0: self-gravitating rotating disk
-// 1: Sod shock tube along x, gas only, no gravity, writes shocktube.dat at T_END
+// test problems, both 0: self-gravitating rotating disk
+// SHOCK_TUBE 1: Sod shock tube along x, gas only, no gravity, writes shocktube.dat
+// GAS_CLOUD 1: polytropic self-gravitating gas cylinder in hydrostatic
+// equilibrium, writes radial profiles to gascloud.dat
 #ifndef SHOCK_TUBE
 #define SHOCK_TUBE 0
+#endif
+#ifndef GAS_CLOUD
+#define GAS_CLOUD 0
 #endif
 
 #if SHOCK_TUBE
@@ -75,6 +80,29 @@
 #define GAS_MASS_FRACTION 1.0
 #define GRAVITY 0
 #define T_END 5.0
+#elif GAS_CLOUD
+// gamma = 2 (n = 1) polytropic cylinder in hydrostatic equilibrium for
+// lap(phi) = 4 pi G rho in 2D: P = K rho^2 gives 2K lap(rho) = -4 pi G rho,
+// so rho(r) = rho_c J0(k r) with k^2 = 2 pi G/K and zero pressure at the
+// radius R = j_01/k, the particles hold total mass 1 (a truncated isothermal
+// cylinder is not an equilibrium in 2D, it is unbound below the critical
+// line mass 2 cs^2/G)
+#define GC_J01 2.404825557695773
+#define GC_J1_AT_J01 0.5191474972894669
+#define GC_R 48.0
+#define GC_K_WAVE (GC_J01/GC_R)
+#define GC_POLY_K (2.0*M_PI*G_EFF/(GC_K_WAVE*GC_K_WAVE))
+#define GC_RHO_C (GC_K_WAVE/(2.0*M_PI*GC_R*GC_J1_AT_J01))
+#define GC_OUT_DT 1.0
+
+#define ISOTHERMAL 0
+#define GAMMA 2.0
+
+#define NUM_DM_PARTICLES 0
+#define NUM_GAS_PARTICLES 1000000
+#define GAS_MASS_FRACTION 1.0
+#define GRAVITY 1
+#define T_END 10.0
 #else
 // number of particles per species
 #define NUM_DM_PARTICLES (4*512000)
@@ -110,9 +138,15 @@
 // gas equation of state
 // ISOTHERMAL=1: P = CS_ISO^2 rho, internal energy is not evolved
 // ISOTHERMAL=0: ideal gas P = (GAMMA - 1) rho u with adiabatic du/dt
+#ifndef ISOTHERMAL
 #define ISOTHERMAL 0
+#endif
+#ifndef GAMMA
 #define GAMMA (5.0/3.0)
+#endif
+#ifndef CS_ISO
 #define CS_ISO 5.0
+#endif
 
 // initial gas sound speed in cells per time unit, sets initial u
 #define CS_INIT 5.0
@@ -123,6 +157,15 @@
 
 // gas density below which a cell is treated as empty
 #define RHO_GAS_FLOOR (1.0e-3*GAS_MASS)
+
+// density floors for -grad(P)/rho on the mesh: the gradient in a sparse cell
+// at a gas edge is sampled from much denser neighbors, so a stray particle
+// there would be kicked by far more than the resolved pressure acceleration.
+// The denominator is at least RHO_ACC_FLOOR and at least RHO_ACC_EDGE times
+// the mean density of the two neighbors used for that gradient component;
+// momentum stays exactly conserved wherever neither floor is active
+#define RHO_ACC_FLOOR (GAS_MASS)
+#define RHO_ACC_EDGE 0.5
 
 // von Neumann-Richtmyer artificial viscosity, linear and quadratic terms,
 // applied in converging flow only
@@ -563,7 +606,7 @@ void *acceleration_interpolation_thread(void *threadarg){
 
 // compute gas pressure including artificial viscosity and specific internal
 // energy rate -(P/rho) div(v) on the mesh, returns maximum sound speed and velocity
-void compute_gas_pressure(const double *grid_fields, double *press, double *du_mesh, double *vel, double *cs_max, double *v_max){
+void compute_gas_pressure(const double *grid_fields, double *press, double *du_mesh, double *vel, double *acc, double *cs_max, double *v_max){
   int ii, jj, nn;
   int nxp, nxm, nyp, nym;
   double rho, cs2, divv, q, vabs;
@@ -574,25 +617,33 @@ void compute_gas_pressure(const double *grid_fields, double *press, double *du_m
   const double *my_gas = &grid_fields[FIELD_GAS_MOM_Y*NUM_CELLS*NUM_CELLS];
   double *vx = &vel[0];
   double *vy = &vel[NUM_CELLS*NUM_CELLS];
+  double *ax = &acc[0];
+  double *ay = &acc[NUM_CELLS*NUM_CELLS];
 
   *cs_max = 0.0;
   *v_max = 0.0;
 
-  // mesh velocity and thermal pressure
+  // mass weighted mesh velocity and thermal pressure
   for(nn=0; nn<NUM_CELLS*NUM_CELLS; nn++) {
     rho = rho_gas[nn];
-    if(rho > RHO_GAS_FLOOR) {
+    if(rho > 0.0) {
       vx[nn] = mx_gas[nn]/rho;
       vy[nn] = my_gas[nn]/rho;
+    }
+    else {
+      vx[nn] = 0.0;
+      vy[nn] = 0.0;
+    }
+
+    if(rho > RHO_GAS_FLOOR) {
 #if ISOTHERMAL
       press[nn] = CS_ISO*CS_ISO*rho;
+      (void)e_gas;
 #else
       press[nn] = (GAMMA - 1.0)*e_gas[nn];
 #endif
     }
     else {
-      vx[nn] = 0.0;
-      vy[nn] = 0.0;
       press[nn] = 0.0;
     }
   }
@@ -647,18 +698,45 @@ void compute_gas_pressure(const double *grid_fields, double *press, double *du_m
     }
   }
 
+  // pressure acceleration -grad(P)/rho at the mesh nodes, dividing by the
+  // mesh density before interpolating to particles conserves total momentum
+  // exactly: sum_p m_p sum_c w_pc a_c = sum_c rho_c a_c = -sum_c grad(P)_c = 0
+  // (up to the floored cells at gas edges)
+  for(jj=0; jj<NUM_CELLS; jj++) {
+    for(ii=0; ii<NUM_CELLS; ii++) {
+      nn = jj*NUM_CELLS + ii;
+      rho = rho_gas[nn];
+
+      if(rho > 0.0) {
+	nxm = jj*NUM_CELLS + modulo(ii-1, NUM_CELLS);
+	nxp = jj*NUM_CELLS + modulo(ii+1, NUM_CELLS);
+	nym = modulo(jj-1, NUM_CELLS)*NUM_CELLS + ii;
+	nyp = modulo(jj+1, NUM_CELLS)*NUM_CELLS + ii;
+
+	rho = fmax(rho, RHO_ACC_FLOOR);
+	ax[nn] = 0.5*(press[nxm] - press[nxp])/fmax(rho, RHO_ACC_EDGE*0.5*(rho_gas[nxm] + rho_gas[nxp]));
+	ay[nn] = 0.5*(press[nym] - press[nyp])/fmax(rho, RHO_ACC_EDGE*0.5*(rho_gas[nym] + rho_gas[nyp]));
+      }
+      else {
+	ax[nn] = 0.0;
+	ay[nn] = 0.0;
+      }
+    }
+  }
+
   *cs_max = sqrt(*cs_max);
   *v_max = sqrt(*v_max);
 }
 
 // add pressure acceleration to gas particles, compute du/dt and blend
-// particle velocities towards the mesh velocity
+// particle velocities towards the mesh velocity, all mesh quantities are
+// interpolated with the CIC weights used for the deposit so that the
+// pressure force and the blending conserve total momentum
 void *hydro_interpolation_thread(void *threadarg){
   int nn, lo, hi, ii, jj;
   double *r, *v, *a, *u, *du;
-  const double *rho_gas, *mx_gas, *my_gas, *press, *du_mesh;
+  const double *ax, *ay, *vx, *vy, *du_mesh;
   double dr[2];
-  double gx, gy, rho_p;
   double wx, wy;
 
   struct thread_data *my_data;
@@ -671,10 +749,10 @@ void *hydro_interpolation_thread(void *threadarg){
   a=my_data->a;
   u=my_data->u;
   du=my_data->du;
-  rho_gas=&my_data->grid_fields[FIELD_RHO_GAS*NUM_CELLS*NUM_CELLS];
-  mx_gas=&my_data->grid_fields[FIELD_GAS_MOM_X*NUM_CELLS*NUM_CELLS];
-  my_gas=&my_data->grid_fields[FIELD_GAS_MOM_Y*NUM_CELLS*NUM_CELLS];
-  press=my_data->press;
+  ax=&my_data->acc_mesh[0];
+  ay=&my_data->acc_mesh[NUM_CELLS*NUM_CELLS];
+  vx=&my_data->vel_mesh[0];
+  vy=&my_data->vel_mesh[NUM_CELLS*NUM_CELLS];
   du_mesh=my_data->du_mesh;
 
   thread_id=my_data->thread_id;
@@ -688,34 +766,25 @@ void *hydro_interpolation_thread(void *threadarg){
     dr[0] = r[nn*NUM_DIMS + 0] - (double)(ii);
     dr[1] = r[nn*NUM_DIMS + 1] - (double)(jj);
 
-    // gas density at particle, nonzero since the particle deposited itself
-    rho_p = cic_interp(rho_gas, ii, jj, dr, NUM_CELLS);
+    // a = -grad(P)/rho, divided by density on the mesh
+    a[nn*NUM_DIMS + 0] += cic_interp(ax, ii, jj, dr, NUM_CELLS);
+    a[nn*NUM_DIMS + 1] += cic_interp(ay, ii, jj, dr, NUM_CELLS);
 
-    if(rho_p > 0.0) {
-      // a = -grad(P)/rho
-      cic_neg_gradient(press, ii, jj, dr, NUM_CELLS, &gx, &gy);
-      a[nn*NUM_DIMS + 0] += gx/rho_p;
-      a[nn*NUM_DIMS + 1] += gy/rho_p;
+    // du/dt = -(P/rho) div(v), divided by density on the mesh
+    du[nn - species[SPECIES_GAS].offset] = cic_interp(du_mesh, ii, jj, dr, NUM_CELLS);
 
-      // du/dt = -(P/rho) div(v), already divided by density on the mesh
-      du[nn - species[SPECIES_GAS].offset] = cic_interp(du_mesh, ii, jj, dr, NUM_CELLS);
+    if(PIC_BLEND > 0.0) {
+      // velocity relative to the mass weighted mesh velocity at the particle
+      wx = v[nn*NUM_DIMS + 0] - cic_interp(vx, ii, jj, dr, NUM_CELLS);
+      wy = v[nn*NUM_DIMS + 1] - cic_interp(vy, ii, jj, dr, NUM_CELLS);
 
-      if(PIC_BLEND > 0.0) {
-	// velocity relative to the mass weighted mesh velocity at the particle
-	wx = v[nn*NUM_DIMS + 0] - cic_interp(mx_gas, ii, jj, dr, NUM_CELLS)/rho_p;
-	wy = v[nn*NUM_DIMS + 1] - cic_interp(my_gas, ii, jj, dr, NUM_CELLS)/rho_p;
+      v[nn*NUM_DIMS + 0] -= PIC_BLEND*wx;
+      v[nn*NUM_DIMS + 1] -= PIC_BLEND*wy;
 
-	v[nn*NUM_DIMS + 0] -= PIC_BLEND*wx;
-	v[nn*NUM_DIMS + 1] -= PIC_BLEND*wy;
-
-	// the removed relative kinetic energy becomes heat
-	if(PIC_BLEND_HEAT && !ISOTHERMAL) {
-	  u[nn - species[SPECIES_GAS].offset] += 0.5*PIC_BLEND*(2.0 - PIC_BLEND)*(wx*wx + wy*wy);
-	}
+      // the removed relative kinetic energy becomes heat
+      if(PIC_BLEND_HEAT && !ISOTHERMAL) {
+	u[nn - species[SPECIES_GAS].offset] += 0.5*PIC_BLEND*(2.0 - PIC_BLEND)*(wx*wx + wy*wy);
       }
-    }
-    else {
-      du[nn - species[SPECIES_GAS].offset] = 0.0;
     }
   }
 
@@ -750,6 +819,101 @@ void run_threads(void *(*fn)(void *)){
     }
   }
 }
+
+#if GAS_CLOUD
+// polytropic cylinder on a sunflower pattern: radii from the inverse of the
+// enclosed mass fraction m(r) = r J1(k r)/(R J1(k R)) by bisection, golden
+// angle azimuths, u = P/((gamma - 1) rho) = K rho for gamma = 2
+void init_gas_cloud(double *r, double *v, double *a, double *u, double *du){
+  int nn, it;
+  double q, lo, hi, mid, th;
+  double golden = M_PI*(3.0 - sqrt(5.0));
+
+  for(nn=0; nn<NUM_GAS_PARTICLES; nn++) {
+    q = ((double)(nn) + 0.5)/(double)(NUM_GAS_PARTICLES);
+    lo = 0.0;
+    hi = GC_R;
+    for(it=0; it<60; it++) {
+      mid = 0.5*(lo + hi);
+      if(mid*j1(GC_K_WAVE*mid)/(GC_R*GC_J1_AT_J01) < q) {
+	lo = mid;
+      }
+      else {
+	hi = mid;
+      }
+    }
+    th = golden*(double)(nn);
+
+    r[nn*NUM_DIMS + 0] = 0.5*NUM_CELLS + mid*cos(th);
+    r[nn*NUM_DIMS + 1] = 0.5*NUM_CELLS + mid*sin(th);
+    v[nn*NUM_DIMS + 0] = 0.0;
+    v[nn*NUM_DIMS + 1] = 0.0;
+    a[nn*NUM_DIMS + 0] = 0.0;
+    a[nn*NUM_DIMS + 1] = 0.0;
+    u[nn] = GC_POLY_K*GC_RHO_C*j0(GC_K_WAVE*mid)/(GAMMA - 1.0);
+    if(u[nn] < U_MIN) {
+      u[nn] = U_MIN;
+    }
+    du[nn] = 0.0;
+  }
+}
+
+static int compare_double(const void *x, const void *y){
+  double dx = *(const double *)x, dy = *(const double *)y;
+  return (dx > dy) - (dx < dy);
+}
+
+// append a radial density profile about the gas center of mass, normalized
+// to the initial central density, and Lagrangian radii to fp
+void write_gas_cloud_profile(FILE *fp, const double *r, double t){
+  int nn, bb;
+  double cx = 0.0, cy = 0.0, dx, dy;
+  double lagr_frac[5] = {0.1, 0.25, 0.5, 0.75, 0.9};
+  double lagr[5];
+  static double rad[NUM_GAS_PARTICLES];
+  // radial bins of half a cell out to twice the truncation radius
+  enum { NUM_BINS = (int)(4.0*GC_R) };
+  double hist[NUM_BINS];
+
+  for(nn=0; nn<NUM_GAS_PARTICLES; nn++) {
+    cx += r[nn*NUM_DIMS + 0];
+    cy += r[nn*NUM_DIMS + 1];
+  }
+  cx /= NUM_GAS_PARTICLES;
+  cy /= NUM_GAS_PARTICLES;
+
+  for(bb=0; bb<NUM_BINS; bb++) {
+    hist[bb] = 0.0;
+  }
+  for(nn=0; nn<NUM_GAS_PARTICLES; nn++) {
+    dx = r[nn*NUM_DIMS + 0] - cx;
+    dy = r[nn*NUM_DIMS + 1] - cy;
+    rad[nn] = sqrt(dx*dx + dy*dy);
+    bb = (int)(2.0*rad[nn]);
+    if(bb < NUM_BINS) {
+      hist[bb] += GAS_MASS;
+    }
+  }
+
+  qsort(rad, NUM_GAS_PARTICLES, sizeof(double), compare_double);
+  for(bb=0; bb<5; bb++) {
+    lagr[bb] = rad[(int)(lagr_frac[bb]*NUM_GAS_PARTICLES)];
+  }
+
+  fprintf(fp, "# t %.6f cm_x %.6f cm_y %.6f r10 %.4f r25 %.4f r50 %.4f r75 %.4f r90 %.4f R %.4f\n",
+	  t, cx, cy, lagr[0], lagr[1], lagr[2], lagr[3], lagr[4], GC_R);
+  for(bb=0; bb<NUM_BINS; bb++) {
+    // annulus area pi((r+0.5)^2 - r^2) with r = bb/2
+    fprintf(fp, "%.4f %.8g\n", 0.5*bb + 0.25,
+	    hist[bb]/(M_PI*0.25*(double)(2*bb + 1))/GC_RHO_C);
+  }
+  fprintf(fp, "\n\n");
+  fflush(fp);
+
+  printf("cloud t: %.3f center: (%.4f, %.4f) lagrangian radii r10 %.3f r25 %.3f r50 %.3f r75 %.3f r90 %.3f\n",
+	 t, cx, cy, lagr[0], lagr[1], lagr[2], lagr[3], lagr[4]);
+}
+#endif
 
 #if SHOCK_TUBE
 // gas density, pressure and internal energy of the left (high pressure) state
@@ -863,7 +1027,7 @@ int main(int argc, char *argv[])
   double *v;
   double *a;
 
-#if !SHOCK_TUBE
+#if !SHOCK_TUBE && !GAS_CLOUD
   // initial condition variables
   double r2[NUM_DIMS];
   double dd;
@@ -872,7 +1036,7 @@ int main(int argc, char *argv[])
   
   double *rho, *sub_rho, *rho_species;
   double *u, *du;
-  double *press, *du_mesh, *gas_vel;
+  double *press, *du_mesh, *gas_vel, *gas_acc;
   double cs_max, v_max, e_thermal;
   double acc;
   int s;
@@ -983,7 +1147,8 @@ int main(int argc, char *argv[])
   press=(double *)malloc(NUM_CELLS*NUM_CELLS*sizeof(double));
   du_mesh=(double *)malloc(NUM_CELLS*NUM_CELLS*sizeof(double));
   gas_vel=(double *)malloc(2*NUM_CELLS*NUM_CELLS*sizeof(double));
-  if(!press || !du_mesh || !gas_vel){
+  gas_acc=(double *)malloc(2*NUM_CELLS*NUM_CELLS*sizeof(double));
+  if(!press || !du_mesh || !gas_vel || !gas_acc){
     printf("Out of memory: gas pressure fields not allocated.\n");
     exit(1);
   }
@@ -1028,6 +1193,8 @@ int main(int argc, char *argv[])
   // generate initial condition
 #if SHOCK_TUBE
   init_shock_tube(r, v, a, u, du);
+#elif GAS_CLOUD
+  init_gas_cloud(r, v, a, u, du);
 #else
   // for now gas shares the collisionless rotating disk initial condition
   for(nn=0; nn<NUM_PARTICLES; nn++) {
@@ -1113,6 +1280,18 @@ int main(int argc, char *argv[])
   done=0;
   tt=0;
   sim_time=0.0;
+
+#if GAS_CLOUD
+  FILE *cloud_fp = fopen("gascloud.dat", "w");
+  double next_out = GC_OUT_DT;
+  if(!cloud_fp) {
+    printf("Could not open gascloud.dat for writing.\n");
+    exit(1);
+  }
+  printf("gas cloud: R %.2f cells, central sound speed %.4f cells/time, rho_c %.6e, crossing time R/cs_c %.4f\n",
+	 GC_R, sqrt(GAMMA*GC_POLY_K*GC_RHO_C), GC_RHO_C, GC_R/sqrt(GAMMA*GC_POLY_K*GC_RHO_C));
+  write_gas_cloud_profile(cloud_fp, r, 0.0);
+#endif
   steps=0;
   
 #if TIFF_ENABLE
@@ -1323,7 +1502,7 @@ int main(int argc, char *argv[])
 #endif
 
     // gas pressure on the mesh and pressure acceleration on gas particles
-    compute_gas_pressure(rho_species, press, du_mesh, gas_vel, &cs_max, &v_max);
+    compute_gas_pressure(rho_species, press, du_mesh, gas_vel, gas_acc, &cs_max, &v_max);
 
     for(nn=0;nn<NUM_THREADS;nn++){
       thread_data_array[nn].r=r;
@@ -1332,7 +1511,8 @@ int main(int argc, char *argv[])
       thread_data_array[nn].u=u;
       thread_data_array[nn].du=du;
       thread_data_array[nn].grid_fields=rho_species;
-      thread_data_array[nn].press=press;
+      thread_data_array[nn].acc_mesh=gas_acc;
+      thread_data_array[nn].vel_mesh=gas_vel;
       thread_data_array[nn].du_mesh=du_mesh;
     }
     run_threads(hydro_interpolation_thread);
@@ -1475,6 +1655,17 @@ int main(int argc, char *argv[])
       dt = CFL_TARGET/(cs_max + v_max);
     }
 
+#if GAS_CLOUD
+    // profile output, the step is shortened to land on output times
+    if(sim_time >= next_out - 1.0e-12) {
+      write_gas_cloud_profile(cloud_fp, r, sim_time);
+      next_out += GC_OUT_DT;
+    }
+    if(sim_time + dt > next_out) {
+      dt = next_out - sim_time;
+    }
+#endif
+
     // stop at T_END, last step is shortened to land on it
     if(T_END > 0.0) {
       if(sim_time >= T_END - 1.0e-12) {
@@ -1493,6 +1684,10 @@ int main(int argc, char *argv[])
     tt++;
     steps++;
   }
+
+#if GAS_CLOUD
+  fclose(cloud_fp);
+#endif
 
   // clean up FFTW
   fftw_destroy_plan(rho_plan);

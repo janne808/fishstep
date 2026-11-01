@@ -71,9 +71,11 @@ struct thread_data{
   double *u;
   double *du;
 
-  // summed mesh fields, gas pressure and specific internal energy rate
+  // summed mesh fields, gas pressure acceleration, mass weighted gas
+  // velocity and specific internal energy rate on the mesh
   double *grid_fields;
-  double *press;
+  double *acc_mesh;
+  double *vel_mesh;
   double *du_mesh;
 
   double dt;
@@ -123,27 +125,6 @@ static inline double cic_interp(const double *f, int ii, int jj, const double *d
     f[jj*n + ip]*(dr[0])*(1.0 - dr[1]) +
     f[jp*n + ii]*(1.0 - dr[0])*(dr[1]) +
     f[jp*n + ip]*(dr[0])*(dr[1]);
-}
-
-// cloud in cell interpolation of the negative gradient of a periodic field f,
-// gradient taken with 2nd order central differences at the cell nodes
-static inline void cic_neg_gradient(const double *f, int ii, int jj, const double *dr, int n, double *gx, double *gy){
-  int im = modulo(ii-1, n), ip = modulo(ii+1, n), ip2 = modulo(ii+2, n);
-  int jm = modulo(jj-1, n), jp = modulo(jj+1, n), jp2 = modulo(jj+2, n);
-  double w00 = (1.0 - dr[0])*(1.0 - dr[1]);
-  double w10 = (dr[0])*(1.0 - dr[1]);
-  double w01 = (1.0 - dr[0])*(dr[1]);
-  double w11 = (dr[0])*(dr[1]);
-
-  *gx = 0.5*((f[jj*n + im] - f[jj*n + ip])*w00 +
-	     (f[jj*n + ii] - f[jj*n + ip2])*w10 +
-	     (f[jp*n + im] - f[jp*n + ip])*w01 +
-	     (f[jp*n + ii] - f[jp*n + ip2])*w11);
-
-  *gy = 0.5*((f[jm*n + ii] - f[jp*n + ii])*w00 +
-	     (f[jm*n + ip] - f[jp*n + ip])*w10 +
-	     (f[jj*n + ii] - f[jp2*n + ii])*w01 +
-	     (f[jj*n + ip] - f[jp2*n + ip])*w11);
 }
 
 #endif

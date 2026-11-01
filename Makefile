@@ -54,9 +54,9 @@ fishstep: 	$(OBJ)
 fishstep.o:	fishstep.c
 	$(CC) $(OPTS) $(CFLAGS) $(SDL_OPTS) $(TIFFLIB_OPTS) $(FFTW3_OPTS) -c $<
 
-.PHONY: clean shocktube
+.PHONY: clean shocktube gascloud
 clean:
-	rm -f *.o fishstep fishstep_shocktube
+	rm -f *.o fishstep fishstep_shocktube fishstep_gascloud
 
 # Sod shock tube test: gas only, no gravity, no window, writes shocktube.dat
 fishstep_shocktube:	fishstep.c fishstep.h
@@ -66,3 +66,12 @@ shocktube:	fishstep_shocktube
 	./fishstep_shocktube
 	python3 tests/shocktube.py shocktube.dat
 
+
+# self-gravitating isothermal gas cylinder: gravity and gas, no window,
+# writes gascloud.dat
+fishstep_gascloud:	fishstep.c fishstep.h
+	$(CC) -o $@ fishstep.c $(OPTS) -DGAS_CLOUD=1 -DSDL=0 $(CFLAGS) $(FFTW3_OPTS)
+
+gascloud:	fishstep_gascloud
+	./fishstep_gascloud
+	python3 tests/gascloud.py gascloud.dat
