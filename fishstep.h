@@ -78,6 +78,9 @@ struct thread_data{
   double *vel_mesh;
   double *du_mesh;
 
+  // kinetic energy removed by FLIP blending minus the heat returned, per thread
+  double flip_loss;
+
   double dt;
 };
 

@@ -5,9 +5,10 @@ gamma = 2 polytropic equilibrium rho(r) = rho_c J0(k r), k = j01/R.
 Usage: python3 tests/gascloud.py gascloud.dat [output.png]
 
 The data file is written by fishstep built with -DGAS_CLOUD=1: one block per
-output time with a header line holding the time, gas center of mass and
-Lagrangian radii containing 10, 25, 50, 75 and 90% of the mass, followed by
-the radial density profile normalized to the exact central density.
+output time with a header line holding the time, gas center of mass,
+Lagrangian radii containing 10, 25, 50, 75 and 90% of the mass and, after
+the first mesh solve, the energy budget, followed by the radial density
+profile normalized to the exact central density.
 """
 
 import sys
@@ -100,6 +101,17 @@ def main():
         rho_core = np.sum(rho[core] * r[core]) / np.sum(ex[core] * r[core])
         drift = np.hypot(meta["cm_x"] - blocks[0][0]["cm_x"], meta["cm_y"] - blocks[0][0]["cm_y"])
         print(f"{meta['t']:5.1f}  {100*l1:6.2f}%                         {rho_core:.4f}                    {drift:.4f}")
+
+    # total energy relative to the first output with an energy budget, the
+    # potential needs a mesh solve so t = 0 has none
+    eb = [m for m, _ in blocks if "E_kin" in m]
+    if eb:
+        e0 = eb[0]["E_kin"] + eb[0]["E_th"] + eb[0]["E_pot"]
+        print("time   E_kin         E_th          E_pot          (E - E0)/|E0|   FLIP loss      work residual")
+        for m in eb:
+            e = m["E_kin"] + m["E_th"] + m["E_pot"]
+            print(f"{m['t']:5.1f}  {m['E_kin']:.5e}  {m['E_th']:.5e}  {m['E_pot']:.6e}  {(e - e0)/abs(e0):+.3e}      "
+                  f"{m['flip_loss']:.2e}       {m['work_res']:+.2e}")
 
     try:
         import matplotlib

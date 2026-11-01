@@ -79,7 +79,9 @@
 #define NUM_GAS_PARTICLES ((NUM_CELLS*NUM_CELLS/2)*(ST_PPC_L_X*ST_PPC_L_Y + ST_PPC_R_X*ST_PPC_R_Y))
 #define GAS_MASS_FRACTION 1.0
 #define GRAVITY 0
+#ifndef T_END
 #define T_END 5.0
+#endif
 #elif GAS_CLOUD
 // gamma = 2 (n = 1) polytropic cylinder in hydrostatic equilibrium for
 // lap(phi) = 4 pi G rho in 2D: P = K rho^2 gives 2K lap(rho) = -4 pi G rho,
@@ -102,7 +104,9 @@
 #define NUM_GAS_PARTICLES 1000000
 #define GAS_MASS_FRACTION 1.0
 #define GRAVITY 1
+#ifndef T_END
 #define T_END 10.0
+#endif
 #else
 // number of particles per species
 #define NUM_DM_PARTICLES (4*512000)
@@ -158,13 +162,14 @@
 // gas density below which a cell is treated as empty
 #define RHO_GAS_FLOOR (1.0e-3*GAS_MASS)
 
-// density floors for -grad(P)/rho on the mesh: the gradient in a sparse cell
-// at a gas edge is sampled from much denser neighbors, so a stray particle
-// there would be kicked by far more than the resolved pressure acceleration.
-// The denominator is at least RHO_ACC_FLOOR and at least RHO_ACC_EDGE times
-// the mean density of the two neighbors used for that gradient component;
-// momentum stays exactly conserved wherever neither floor is active
-#define RHO_ACC_FLOOR (GAS_MASS)
+// pressure forces act through cell faces, face f between cells i and j pushes
+// them apart with F_f = lambda_f (P_i + P_j)/2. A sparse cell next to a dense
+// one at a gas edge would be kicked far beyond the resolved acceleration, so
+// lambda_f = min(1, rho_min/(RHO_ACC_EDGE*(rho_i + rho_j)/2)) limits the face
+// and the force it no longer applies to the sparse cell stays with the dense
+// one. Faces into empty cells have lambda_f = 0. Any lambda_f conserves
+// momentum and energy exactly, the work of each face is taken from the
+// internal energy of the two cells it pushes
 #define RHO_ACC_EDGE 0.5
 
 // von Neumann-Richtmyer artificial viscosity, linear and quadratic terms,
@@ -604,12 +609,24 @@ void *acceleration_interpolation_thread(void *threadarg){
   pthread_exit(NULL);
 }
 
-// compute gas pressure including artificial viscosity and specific internal
-// energy rate -(P/rho) div(v) on the mesh, returns maximum sound speed and velocity
-void compute_gas_pressure(const double *grid_fields, double *press, double *du_mesh, double *vel, double *acc, double *cs_max, double *v_max){
+// pressure force limiter of the face between cells with gas densities rho_i
+// and rho_j, symmetric in its arguments so both cells see the same value
+static inline double face_lambda(double rho_i, double rho_j){
+  if(rho_i <= RHO_GAS_FLOOR || rho_j <= RHO_GAS_FLOOR) {
+    return 0.0;
+  }
+  return fmin(1.0, fmin(rho_i, rho_j)/(RHO_ACC_EDGE*0.5*(rho_i + rho_j)));
+}
+
+// compute gas pressure including artificial viscosity, the face pressure
+// acceleration and the matching specific internal energy rate on the mesh,
+// returns maximum sound speed and velocity and the residual of the discrete
+// work balance, which is zero up to roundoff
+void compute_gas_pressure(const double *grid_fields, double *press, double *du_mesh, double *vel, double *acc, double *cs_max, double *v_max, double *p_res){
   int ii, jj, nn;
   int nxp, nxm, nyp, nym;
   double rho, cs2, divv, q, vabs;
+  double l_xm, l_xp, l_ym, l_yp;
 
   const double *rho_gas = &grid_fields[FIELD_RHO_GAS*NUM_CELLS*NUM_CELLS];
   const double *e_gas = &grid_fields[FIELD_GAS_ENERGY*NUM_CELLS*NUM_CELLS];
@@ -648,14 +665,13 @@ void compute_gas_pressure(const double *grid_fields, double *press, double *du_m
     }
   }
 
-  // velocity divergence, artificial viscosity and p div v
+  // velocity divergence and artificial viscosity
   for(jj=0; jj<NUM_CELLS; jj++) {
     for(ii=0; ii<NUM_CELLS; ii++) {
       nn = jj*NUM_CELLS + ii;
       rho = rho_gas[nn];
 
       if(rho <= RHO_GAS_FLOOR) {
-	du_mesh[nn] = 0.0;
 	continue;
       }
 
@@ -692,36 +708,50 @@ void compute_gas_pressure(const double *grid_fields, double *press, double *du_m
       }
 
       press[nn] += q;
-
-      // specific internal energy rate -(P/rho) div v
-      du_mesh[nn] = -press[nn]*divv/rho;
     }
   }
 
-  // pressure acceleration -grad(P)/rho at the mesh nodes, dividing by the
-  // mesh density before interpolating to particles conserves total momentum
-  // exactly: sum_p m_p sum_c w_pc a_c = sum_c rho_c a_c = -sum_c grad(P)_c = 0
-  // (up to the floored cells at gas edges)
+  // face pressure forces, acceleration f_c/rho_c and specific internal energy
+  // rate at the mesh nodes. With lambda = 1 this is the central difference
+  // -grad(P)/rho and -(P/rho) div(v). Each face exchanges equal and opposite
+  // momentum between its cells, so sum_c rho_c a_c = 0, and the face work
+  // F_f (V_j - V_i) gained as kinetic energy is removed from the cells in
+  // proportion to their pressure, so sum_c (mom_c.a_c + rho_c du_c) = 0
   for(jj=0; jj<NUM_CELLS; jj++) {
     for(ii=0; ii<NUM_CELLS; ii++) {
       nn = jj*NUM_CELLS + ii;
       rho = rho_gas[nn];
 
-      if(rho > 0.0) {
-	nxm = jj*NUM_CELLS + modulo(ii-1, NUM_CELLS);
-	nxp = jj*NUM_CELLS + modulo(ii+1, NUM_CELLS);
-	nym = modulo(jj-1, NUM_CELLS)*NUM_CELLS + ii;
-	nyp = modulo(jj+1, NUM_CELLS)*NUM_CELLS + ii;
-
-	rho = fmax(rho, RHO_ACC_FLOOR);
-	ax[nn] = 0.5*(press[nxm] - press[nxp])/fmax(rho, RHO_ACC_EDGE*0.5*(rho_gas[nxm] + rho_gas[nxp]));
-	ay[nn] = 0.5*(press[nym] - press[nyp])/fmax(rho, RHO_ACC_EDGE*0.5*(rho_gas[nym] + rho_gas[nyp]));
-      }
-      else {
+      if(rho <= RHO_GAS_FLOOR) {
 	ax[nn] = 0.0;
 	ay[nn] = 0.0;
+	du_mesh[nn] = 0.0;
+	continue;
       }
+
+      nxm = jj*NUM_CELLS + modulo(ii-1, NUM_CELLS);
+      nxp = jj*NUM_CELLS + modulo(ii+1, NUM_CELLS);
+      nym = modulo(jj-1, NUM_CELLS)*NUM_CELLS + ii;
+      nyp = modulo(jj+1, NUM_CELLS)*NUM_CELLS + ii;
+
+      l_xm = face_lambda(rho_gas[nxm], rho);
+      l_xp = face_lambda(rho, rho_gas[nxp]);
+      l_ym = face_lambda(rho_gas[nym], rho);
+      l_yp = face_lambda(rho, rho_gas[nyp]);
+
+      ax[nn] = 0.5*(l_xm*(press[nxm] + press[nn]) - l_xp*(press[nn] + press[nxp]))/rho;
+      ay[nn] = 0.5*(l_ym*(press[nym] + press[nn]) - l_yp*(press[nn] + press[nyp]))/rho;
+
+      du_mesh[nn] = -0.5*press[nn]*(l_xp*(vx[nxp] - vx[nn]) + l_xm*(vx[nn] - vx[nxm]) +
+				    l_yp*(vy[nyp] - vy[nn]) + l_ym*(vy[nn] - vy[nym]))/rho;
     }
+  }
+
+  // residual of the discrete work balance: the pressure power on particles
+  // sum_p m v.a = sum_c mom.a_c should cancel the heating sum_c rho du_c
+  *p_res = 0.0;
+  for(nn=0; nn<NUM_CELLS*NUM_CELLS; nn++) {
+    *p_res += mx_gas[nn]*ax[nn] + my_gas[nn]*ay[nn] + rho_gas[nn]*du_mesh[nn];
   }
 
   *cs_max = sqrt(*cs_max);
@@ -733,11 +763,14 @@ void compute_gas_pressure(const double *grid_fields, double *press, double *du_m
 // interpolated with the CIC weights used for the deposit so that the
 // pressure force and the blending conserve total momentum
 void *hydro_interpolation_thread(void *threadarg){
-  int nn, lo, hi, ii, jj;
+  int nn, lo, hi, ii, jj, kk, gg;
   double *r, *v, *a, *u, *du;
   const double *ax, *ay, *vx, *vy, *du_mesh;
   double dr[2];
-  double wx, wy;
+  double w[4];
+  int c[4];
+  double vpx, vpy, wx, wy, var, v2, h;
+  double flip_loss = 0.0;
 
   struct thread_data *my_data;
   int thread_id;
@@ -766,27 +799,62 @@ void *hydro_interpolation_thread(void *threadarg){
     dr[0] = r[nn*NUM_DIMS + 0] - (double)(ii);
     dr[1] = r[nn*NUM_DIMS + 1] - (double)(jj);
 
-    // a = -grad(P)/rho, divided by density on the mesh
+    gg = nn - species[SPECIES_GAS].offset;
+
+    // a = f/rho from the face pressure forces, divided by density on the mesh
     a[nn*NUM_DIMS + 0] += cic_interp(ax, ii, jj, dr, NUM_CELLS);
     a[nn*NUM_DIMS + 1] += cic_interp(ay, ii, jj, dr, NUM_CELLS);
 
-    // du/dt = -(P/rho) div(v), divided by density on the mesh
-    du[nn - species[SPECIES_GAS].offset] = cic_interp(du_mesh, ii, jj, dr, NUM_CELLS);
+    // du/dt from the face work, divided by density on the mesh
+    du[gg] = cic_interp(du_mesh, ii, jj, dr, NUM_CELLS);
 
     if(PIC_BLEND > 0.0) {
-      // velocity relative to the mass weighted mesh velocity at the particle
-      wx = v[nn*NUM_DIMS + 0] - cic_interp(vx, ii, jj, dr, NUM_CELLS);
-      wy = v[nn*NUM_DIMS + 1] - cic_interp(vy, ii, jj, dr, NUM_CELLS);
+      c[0] = jj*NUM_CELLS + ii;
+      c[1] = jj*NUM_CELLS + modulo(ii+1, NUM_CELLS);
+      c[2] = modulo(jj+1, NUM_CELLS)*NUM_CELLS + ii;
+      c[3] = modulo(jj+1, NUM_CELLS)*NUM_CELLS + modulo(ii+1, NUM_CELLS);
 
+      w[0] = (1.0 - dr[0])*(1.0 - dr[1]);
+      w[1] = (dr[0])*(1.0 - dr[1]);
+      w[2] = (1.0 - dr[0])*(dr[1]);
+      w[3] = (dr[0])*(dr[1]);
+
+      // mass weighted mesh velocity V at the particle and its CIC weighted
+      // variance over the four cells
+      vpx = 0.0;
+      vpy = 0.0;
+      for(kk=0; kk<4; kk++) {
+	vpx += w[kk]*vx[c[kk]];
+	vpy += w[kk]*vy[c[kk]];
+      }
+      var = 0.0;
+      for(kk=0; kk<4; kk++) {
+	var += w[kk]*((vx[c[kk]] - vpx)*(vx[c[kk]] - vpx) + (vy[c[kk]] - vpy)*(vy[c[kk]] - vpy));
+      }
+
+      // velocity relative to the mesh velocity, blended by a = PIC_BLEND
+      wx = v[nn*NUM_DIMS + 0] - vpx;
+      wy = v[nn*NUM_DIMS + 1] - vpy;
+
+      v2 = v[nn*NUM_DIMS + 0]*v[nn*NUM_DIMS + 0] + v[nn*NUM_DIMS + 1]*v[nn*NUM_DIMS + 1];
       v[nn*NUM_DIMS + 0] -= PIC_BLEND*wx;
       v[nn*NUM_DIMS + 1] -= PIC_BLEND*wy;
+      flip_loss += 0.5*(v2 - v[nn*NUM_DIMS + 0]*v[nn*NUM_DIMS + 0] - v[nn*NUM_DIMS + 1]*v[nn*NUM_DIMS + 1]);
 
-      // the removed relative kinetic energy becomes heat
+      // the removed kinetic energy becomes heat. Per particle the blend removes
+      // a(2-a)/2 |w|^2 + a V.w, summed over particles the second term is
+      // a (sum_c rho_c |V_c|^2 - sum_p m |V_p|^2) because V_c = mom_c/rho_c,
+      // which equals a sum_p m var_p. Heating each particle by
+      // a(2-a)/2 |w|^2 + a var_p returns exactly the kinetic energy removed
+      // with a local, Galilean invariant and non-negative heat
       if(PIC_BLEND_HEAT && !ISOTHERMAL) {
-	u[nn - species[SPECIES_GAS].offset] += 0.5*PIC_BLEND*(2.0 - PIC_BLEND)*(wx*wx + wy*wy);
+	h = 0.5*PIC_BLEND*(2.0 - PIC_BLEND)*(wx*wx + wy*wy) + PIC_BLEND*var;
+	u[gg] += h;
+	flip_loss -= h;
       }
     }
   }
+  my_data->flip_loss = species[SPECIES_GAS].mass*flip_loss;
 
   pthread_exit(NULL);
 }
@@ -865,7 +933,40 @@ static int compare_double(const void *x, const void *y){
 
 // append a radial density profile about the gas center of mass, normalized
 // to the initial central density, and Lagrangian radii to fp
-void write_gas_cloud_profile(FILE *fp, const double *r, double t){
+// total kinetic, gas thermal and gravitational energy of all particles into
+// e[0], e[1], e[2], the potential energy W = 1/2 sum_c rho_c phi_c uses the
+// mesh potential of the last solve
+void compute_energy(const double *v, const double *u, const double *rho, const double *phi, double *e){
+  int nn, s;
+  double m;
+
+  e[0] = 0.0;
+  e[1] = 0.0;
+  e[2] = 0.0;
+  for(s=0; s<NUM_SPECIES; s++) {
+    m = species[s].mass;
+    for(nn=species[s].offset; nn<species[s].offset + species[s].count; nn++) {
+      e[0] += 0.5*m*(v[nn*NUM_DIMS + 0]*v[nn*NUM_DIMS + 0] + v[nn*NUM_DIMS + 1]*v[nn*NUM_DIMS + 1]);
+    }
+  }
+  for(nn=0; nn<NUM_GAS_PARTICLES; nn++) {
+    e[1] += species[SPECIES_GAS].mass*u[nn];
+  }
+#if GRAVITY
+  for(nn=0; nn<NUM_CELLS*NUM_CELLS; nn++) {
+    e[2] += 0.5*rho[nn]*phi[nn];
+  }
+#else
+  (void)rho;
+  (void)phi;
+#endif
+}
+
+// write the gas cloud radial profile block at time t, energy holds K, U, W,
+// the cumulative FLIP kinetic energy loss not returned as heat and the
+// cumulative residual of the discrete pressure work balance, or is NULL
+// before the first mesh solve
+void write_gas_cloud_profile(FILE *fp, const double *r, double t, const double *energy){
   int nn, bb;
   double cx = 0.0, cy = 0.0, dx, dy;
   double lagr_frac[5] = {0.1, 0.25, 0.5, 0.75, 0.9};
@@ -900,8 +1001,13 @@ void write_gas_cloud_profile(FILE *fp, const double *r, double t){
     lagr[bb] = rad[(int)(lagr_frac[bb]*NUM_GAS_PARTICLES)];
   }
 
-  fprintf(fp, "# t %.6f cm_x %.6f cm_y %.6f r10 %.4f r25 %.4f r50 %.4f r75 %.4f r90 %.4f R %.4f\n",
+  fprintf(fp, "# t %.6f cm_x %.6f cm_y %.6f r10 %.4f r25 %.4f r50 %.4f r75 %.4f r90 %.4f R %.4f",
 	  t, cx, cy, lagr[0], lagr[1], lagr[2], lagr[3], lagr[4], GC_R);
+  if(energy) {
+    fprintf(fp, " E_kin %.10e E_th %.10e E_pot %.10e flip_loss %.4e work_res %.4e",
+	    energy[0], energy[1], energy[2], energy[3], energy[4]);
+  }
+  fprintf(fp, "\n");
   for(bb=0; bb<NUM_BINS; bb++) {
     // annulus area pi((r+0.5)^2 - r^2) with r = bb/2
     fprintf(fp, "%.4f %.8g\n", 0.5*bb + 0.25,
@@ -1038,6 +1144,7 @@ int main(int argc, char *argv[])
   double *u, *du;
   double *press, *du_mesh, *gas_vel, *gas_acc;
   double cs_max, v_max, e_thermal;
+  double p_res, e_flip_loss = 0.0, e_work_res = 0.0;
   double acc;
   int s;
   double *phi;
@@ -1284,13 +1391,14 @@ int main(int argc, char *argv[])
 #if GAS_CLOUD
   FILE *cloud_fp = fopen("gascloud.dat", "w");
   double next_out = GC_OUT_DT;
+  double energy[5];
   if(!cloud_fp) {
     printf("Could not open gascloud.dat for writing.\n");
     exit(1);
   }
   printf("gas cloud: R %.2f cells, central sound speed %.4f cells/time, rho_c %.6e, crossing time R/cs_c %.4f\n",
 	 GC_R, sqrt(GAMMA*GC_POLY_K*GC_RHO_C), GC_RHO_C, GC_R/sqrt(GAMMA*GC_POLY_K*GC_RHO_C));
-  write_gas_cloud_profile(cloud_fp, r, 0.0);
+  write_gas_cloud_profile(cloud_fp, r, 0.0, NULL);
 #endif
   steps=0;
   
@@ -1502,7 +1610,7 @@ int main(int argc, char *argv[])
 #endif
 
     // gas pressure on the mesh and pressure acceleration on gas particles
-    compute_gas_pressure(rho_species, press, du_mesh, gas_vel, gas_acc, &cs_max, &v_max);
+    compute_gas_pressure(rho_species, press, du_mesh, gas_vel, gas_acc, &cs_max, &v_max, &p_res);
 
     for(nn=0;nn<NUM_THREADS;nn++){
       thread_data_array[nn].r=r;
@@ -1516,6 +1624,10 @@ int main(int argc, char *argv[])
       thread_data_array[nn].du_mesh=du_mesh;
     }
     run_threads(hydro_interpolation_thread);
+    for(nn=0;nn<NUM_THREADS;nn++){
+      e_flip_loss += thread_data_array[nn].flip_loss;
+    }
+    e_work_res += p_res*dt;
 
     // create kick integration threads
     pthread_attr_init(&attr);
@@ -1658,7 +1770,12 @@ int main(int argc, char *argv[])
 #if GAS_CLOUD
     // profile output, the step is shortened to land on output times
     if(sim_time >= next_out - 1.0e-12) {
-      write_gas_cloud_profile(cloud_fp, r, sim_time);
+      compute_energy(v, u, rho, phi, energy);
+      energy[3] = e_flip_loss;
+      energy[4] = e_work_res;
+      printf("energy t: %.4f K: %.8e U: %.8e W: %.8e E: %.8e flip loss: %.3e work residual: %.3e\n",
+	     sim_time, energy[0], energy[1], energy[2], energy[0] + energy[1] + energy[2], energy[3], energy[4]);
+      write_gas_cloud_profile(cloud_fp, r, sim_time, energy);
       next_out += GC_OUT_DT;
     }
     if(sim_time + dt > next_out) {
