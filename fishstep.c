@@ -50,7 +50,7 @@
 // number of cells per dimension
 #define NUM_CELLS 512
 
-// test problems, both 0: self-gravitating rotating disk
+// test problems, both 0: protostellar gas disk around a central star
 // SHOCK_TUBE 1: Sod shock tube along x, gas only, no gravity, writes shocktube.dat
 // GAS_CLOUD 1: polytropic self-gravitating gas cylinder in hydrostatic
 // equilibrium, writes radial profiles to gascloud.dat
@@ -108,16 +108,58 @@
 #define T_END 10.0
 #endif
 #else
-// number of particles per species
-#define NUM_DM_PARTICLES (4*512000)
-#define NUM_GAS_PARTICLES (1*512000)
+// star system formation: a self-gravitating gas disk around a protostar, no
+// dark matter. The collisionless species holds a single particle, the star,
+// which moves freely under the mesh gravity of the disk. The disk surface
+// density is sigma ~ 1/r between SD_R_IN and SD_R_OUT with tanh edges of
+// width SD_EDGE_W, so in this 2D gravity (point mass force 2 G M/r) the
+// rotation curve is nearly flat. The gas is isothermal with sound speed
+// SD_ASPECT times the star's circular speed v_K = sqrt(2 G M_star), which is
+// a locally isothermal disk because v_K does not depend on radius. The
+// rotation is put into equilibrium from the gravity and pressure forces the
+// code computes for the initial positions (see set_equilibrium_rotation).
+// In 2D gravity a disk is stable when kappa^2 > 4 pi G sigma, so for this
+// profile Q_2D = M_star/(pi r^2 sigma) ~ 2 (R_out - R_in)/(SD_DISK_TO_STAR r):
+// the outer disk becomes unstable for disk to star mass ratios above ~1.8
+#define STAR_DISK 1
+#ifndef SD_DISK_TO_STAR
+#define SD_DISK_TO_STAR 0.2
+#endif
+#ifndef SD_ASPECT
+#define SD_ASPECT 0.05
+#endif
+#define SD_R_IN 8.0
+#define SD_R_OUT 96.0
+#define SD_EDGE_W 3.0
+#define SD_OUT_DT 2.0
+#define SD_STAR_MASS (1.0/(1.0 + SD_DISK_TO_STAR))
+#define SD_V_K sqrt(2.0*G_EFF*SD_STAR_MASS)
 
-// gas fraction of the total mass, total mass is normalized to 1
-#define GAS_MASS_FRACTION 0.16
+#define ISOTHERMAL 1
+#define CS_ISO (SD_ASPECT*SD_V_K)
 
-// self-gravity on, run until the window is closed
+// FLIP blending toward the CIC mesh velocity does not conserve angular
+// momentum, it exerts a net torque on the disk proportional to the blend
+// fraction, so the disk uses weak blending: 0.02 loses ~0.25% of the angular
+// momentum per outer orbit while keeping particle velocity noise flat, no
+// blending conserves it exactly but the noise grows
+#ifndef PIC_BLEND
+#define PIC_BLEND 0.02
+#endif
+
+#define NUM_DM_PARTICLES 1
+#define NUM_GAS_PARTICLES 1000000
+#define GAS_MASS_FRACTION (SD_DISK_TO_STAR/(1.0 + SD_DISK_TO_STAR))
+
+// self-gravity on, run until the window is closed unless T_END is given
 #define GRAVITY 1
+#ifndef T_END
 #define T_END 0.0
+#endif
+#endif
+
+#ifndef STAR_DISK
+#define STAR_DISK 0
 #endif
 
 #define NUM_PARTICLES (NUM_DM_PARTICLES + NUM_GAS_PARTICLES)
@@ -151,10 +193,6 @@
 #ifndef CS_ISO
 #define CS_ISO 5.0
 #endif
-
-// initial gas sound speed in cells per time unit, sets initial u
-#define CS_INIT 5.0
-#define U_INIT (CS_INIT*CS_INIT/(GAMMA*(GAMMA - 1.0)))
 
 // internal energy floor
 #define U_MIN 1.0e-6
@@ -888,6 +926,207 @@ void run_threads(void *(*fn)(void *)){
   }
 }
 
+#if STAR_DISK
+// star disk surface density profile without normalization
+static double star_disk_sigma(double rr){
+  return 0.25*(1.0 + tanh((rr - SD_R_IN)/SD_EDGE_W))*(1.0 - tanh((rr - SD_R_OUT)/SD_EDGE_W))/rr;
+}
+
+#define SD_R_MAX (SD_R_OUT + 6.0*SD_EDGE_W)
+#define SD_NUM_TAB 8192
+
+// star at rest in the box center, gas on a sunflower pattern with radii from
+// the inverse of the tabulated enclosed mass of the surface density profile,
+// velocities are set later by set_equilibrium_rotation
+void init_star_disk(double *r, double *v, double *a, double *u, double *du){
+  int nn, gg, kk;
+  double rr, q, th, f;
+  double golden = M_PI*(3.0 - sqrt(5.0));
+  static double rad_tab[SD_NUM_TAB + 1], cdf_tab[SD_NUM_TAB + 1];
+
+  // enclosed mass table, sigma ~ 1/r vanishes towards r = 0 through the taper
+  rad_tab[0] = 0.0;
+  cdf_tab[0] = 0.0;
+  for(kk=1; kk<=SD_NUM_TAB; kk++) {
+    rad_tab[kk] = SD_R_MAX*(double)(kk)/(double)(SD_NUM_TAB);
+    rr = 0.5*(rad_tab[kk] + rad_tab[kk-1]);
+    cdf_tab[kk] = cdf_tab[kk-1] + 2.0*M_PI*rr*star_disk_sigma(rr)*(rad_tab[kk] - rad_tab[kk-1]);
+  }
+
+  for(nn=0; nn<NUM_PARTICLES; nn++) {
+    v[nn*NUM_DIMS + 0] = 0.0;
+    v[nn*NUM_DIMS + 1] = 0.0;
+    a[nn*NUM_DIMS + 0] = 0.0;
+    a[nn*NUM_DIMS + 1] = 0.0;
+  }
+
+  // the star
+  for(nn=species[SPECIES_DM].offset; nn<species[SPECIES_DM].offset + species[SPECIES_DM].count; nn++) {
+    r[nn*NUM_DIMS + 0] = 0.5*NUM_CELLS;
+    r[nn*NUM_DIMS + 1] = 0.5*NUM_CELLS;
+  }
+
+  kk = 1;
+  for(gg=0; gg<NUM_GAS_PARTICLES; gg++) {
+    nn = species[SPECIES_GAS].offset + gg;
+    q = ((double)(gg) + 0.5)/(double)(NUM_GAS_PARTICLES)*cdf_tab[SD_NUM_TAB];
+    while(cdf_tab[kk] < q) {
+      kk++;
+    }
+    f = (q - cdf_tab[kk-1])/(cdf_tab[kk] - cdf_tab[kk-1]);
+    rr = rad_tab[kk-1] + f*(rad_tab[kk] - rad_tab[kk-1]);
+    th = golden*(double)(gg);
+
+    r[nn*NUM_DIMS + 0] = 0.5*NUM_CELLS + rr*cos(th);
+    r[nn*NUM_DIMS + 1] = 0.5*NUM_CELLS + rr*sin(th);
+    u[gg] = CS_ISO*CS_ISO/(GAMMA - 1.0);
+    du[gg] = 0.0;
+  }
+}
+
+// bins of half a cell out to SD_R_MAX, as an integer constant expression
+#define SD_NUM_BINS (2*((int)SD_R_OUT + 6*(int)SD_EDGE_W) + 2)
+
+// circular velocities in equilibrium with the accelerations a of the initial
+// positions: the gas acceleration towards the star averaged over radial bins
+// of half a cell gives v_phi^2 = -r <a_r>, interpolated linearly between bin
+// centers. This includes the softened mesh gravity of the star, the disk self
+// gravity, the periodic box and the gas pressure. Net momentum is removed so
+// the center of mass stays at rest, returns the maximum speed
+double set_equilibrium_rotation(double *r, double *v, const double *a){
+  int nn, bb, b0;
+  double dx, dy, rr, ar, vphi2, f, vmax = 0.0;
+  double px = 0.0, py = 0.0, mtot = 0.0, m;
+  double cx = r[species[SPECIES_DM].offset*NUM_DIMS + 0];
+  double cy = r[species[SPECIES_DM].offset*NUM_DIMS + 1];
+  static double sum[SD_NUM_BINS];
+  static int cnt[SD_NUM_BINS];
+  static double prof[SD_NUM_BINS];
+
+  for(bb=0; bb<SD_NUM_BINS; bb++) {
+    sum[bb] = 0.0;
+    cnt[bb] = 0;
+  }
+  for(nn=species[SPECIES_GAS].offset; nn<species[SPECIES_GAS].offset + species[SPECIES_GAS].count; nn++) {
+    dx = r[nn*NUM_DIMS + 0] - cx;
+    dy = r[nn*NUM_DIMS + 1] - cy;
+    rr = sqrt(dx*dx + dy*dy);
+    bb = (int)(2.0*rr);
+    if(rr > 0.0 && bb < SD_NUM_BINS) {
+      ar = (a[nn*NUM_DIMS + 0]*dx + a[nn*NUM_DIMS + 1]*dy)/rr;
+      sum[bb] += -ar*rr;
+      cnt[bb]++;
+    }
+  }
+  for(bb=0; bb<SD_NUM_BINS; bb++) {
+    prof[bb] = cnt[bb] > 0 ? sum[bb]/(double)(cnt[bb]) : -1.0;
+  }
+
+  for(nn=species[SPECIES_GAS].offset; nn<species[SPECIES_GAS].offset + species[SPECIES_GAS].count; nn++) {
+    dx = r[nn*NUM_DIMS + 0] - cx;
+    dy = r[nn*NUM_DIMS + 1] - cy;
+    rr = sqrt(dx*dx + dy*dy);
+
+    // bin centers are at (bb + 1/2)/2
+    f = 2.0*rr - 0.5;
+    b0 = (int)floor(f);
+    f -= (double)(b0);
+    if(b0 >= 0 && b0 + 1 < SD_NUM_BINS && prof[b0] >= 0.0 && prof[b0+1] >= 0.0) {
+      vphi2 = (1.0 - f)*prof[b0] + f*prof[b0+1];
+    }
+    else {
+      // too few particles around, use the particle's own acceleration
+      vphi2 = rr > 0.0 ? -(a[nn*NUM_DIMS + 0]*dx + a[nn*NUM_DIMS + 1]*dy) : 0.0;
+    }
+    vphi2 = fmax(vphi2, 0.0);
+
+    if(rr > 0.0) {
+      v[nn*NUM_DIMS + 0] = -dy/rr*sqrt(vphi2);
+      v[nn*NUM_DIMS + 1] = dx/rr*sqrt(vphi2);
+    }
+  }
+
+  // remove the net momentum of star and gas together
+  for(nn=0; nn<NUM_PARTICLES; nn++) {
+    m = nn < species[SPECIES_GAS].offset ? species[SPECIES_DM].mass : species[SPECIES_GAS].mass;
+    px += m*v[nn*NUM_DIMS + 0];
+    py += m*v[nn*NUM_DIMS + 1];
+    mtot += m;
+  }
+  for(nn=0; nn<NUM_PARTICLES; nn++) {
+    v[nn*NUM_DIMS + 0] -= px/mtot;
+    v[nn*NUM_DIMS + 1] -= py/mtot;
+    vmax = fmax(vmax, sqrt(v[nn*NUM_DIMS + 0]*v[nn*NUM_DIMS + 0] + v[nn*NUM_DIMS + 1]*v[nn*NUM_DIMS + 1]));
+  }
+
+  return vmax;
+}
+
+// radial profile of the gas disk around the star in bins of one cell:
+// surface density, mean azimuthal and radial velocity relative to the star
+// and the rms radial velocity, header with the star state and the total
+// angular momentum about the center of mass
+void write_star_disk_profile(FILE *fp, const double *r, const double *v, double t){
+  int nn, bb;
+  int ns = species[SPECIES_DM].offset;
+  double cx = r[ns*NUM_DIMS + 0], cy = r[ns*NUM_DIMS + 1];
+  double svx = v[ns*NUM_DIMS + 0], svy = v[ns*NUM_DIMS + 1];
+  double dx, dy, dvx, dvy, rr, m, mtot = 0.0;
+  double gx = 0.0, gy = 0.0, gvx = 0.0, gvy = 0.0, lz = 0.0;
+  enum { NB = (int)SD_R_OUT + 6*(int)SD_EDGE_W + 1 };
+  double mass[NB], vphi[NB], vr[NB], vr2[NB];
+
+  for(bb=0; bb<NB; bb++) {
+    mass[bb] = vphi[bb] = vr[bb] = vr2[bb] = 0.0;
+  }
+
+  // center of mass position and velocity
+  for(nn=0; nn<NUM_PARTICLES; nn++) {
+    m = nn < species[SPECIES_GAS].offset ? species[SPECIES_DM].mass : species[SPECIES_GAS].mass;
+    gx += m*r[nn*NUM_DIMS + 0];
+    gy += m*r[nn*NUM_DIMS + 1];
+    gvx += m*v[nn*NUM_DIMS + 0];
+    gvy += m*v[nn*NUM_DIMS + 1];
+    mtot += m;
+  }
+  gx /= mtot; gy /= mtot; gvx /= mtot; gvy /= mtot;
+
+  for(nn=0; nn<NUM_PARTICLES; nn++) {
+    m = nn < species[SPECIES_GAS].offset ? species[SPECIES_DM].mass : species[SPECIES_GAS].mass;
+    lz += m*((r[nn*NUM_DIMS + 0] - gx)*(v[nn*NUM_DIMS + 1] - gvy) - (r[nn*NUM_DIMS + 1] - gy)*(v[nn*NUM_DIMS + 0] - gvx));
+    if(nn < species[SPECIES_GAS].offset) {
+      continue;
+    }
+    dx = r[nn*NUM_DIMS + 0] - cx;
+    dy = r[nn*NUM_DIMS + 1] - cy;
+    dvx = v[nn*NUM_DIMS + 0] - svx;
+    dvy = v[nn*NUM_DIMS + 1] - svy;
+    rr = sqrt(dx*dx + dy*dy);
+    bb = (int)(rr);
+    if(rr > 0.0 && bb < NB) {
+      mass[bb] += m;
+      vphi[bb] += m*(dx*dvy - dy*dvx)/rr;
+      vr[bb] += m*(dx*dvx + dy*dvy)/rr;
+      vr2[bb] += m*(dx*dvx + dy*dvy)*(dx*dvx + dy*dvy)/(rr*rr);
+    }
+  }
+
+  fprintf(fp, "# t %.6f star_x %.6f star_y %.6f star_vx %.6e star_vy %.6e cm_x %.6f cm_y %.6f Lz %.10e "
+	  "R_in %.3f R_out %.3f v_K %.6f cs %.6f disk_to_star %.4f\n",
+	  t, cx, cy, svx, svy, gx, gy, lz, SD_R_IN, SD_R_OUT, SD_V_K, CS_ISO, SD_DISK_TO_STAR);
+  for(bb=0; bb<NB; bb++) {
+    if(mass[bb] > 0.0) {
+      fprintf(fp, "%.2f %.8e %.6e %.6e %.6e\n", bb + 0.5, mass[bb]/(M_PI*(double)(2*bb + 1)),
+	      vphi[bb]/mass[bb], vr[bb]/mass[bb], sqrt(vr2[bb]/mass[bb]));
+    }
+  }
+  fprintf(fp, "\n\n");
+  fflush(fp);
+
+  printf("disk t: %.3f star: (%.4f, %.4f) v (%.3e, %.3e) Lz %.8e\n", t, cx, cy, svx, svy, lz);
+}
+#endif
+
 #if GAS_CLOUD
 // polytropic cylinder on a sunflower pattern: radii from the inverse of the
 // enclosed mass fraction m(r) = r J1(k r)/(R J1(k R)) by bisection, golden
@@ -1133,12 +1372,6 @@ int main(int argc, char *argv[])
   double *v;
   double *a;
 
-#if !SHOCK_TUBE && !GAS_CLOUD
-  // initial condition variables
-  double r2[NUM_DIMS];
-  double dd;
-  double vv;
-#endif
   
   double *rho, *sub_rho, *rho_species;
   double *u, *du;
@@ -1303,42 +1536,7 @@ int main(int argc, char *argv[])
 #elif GAS_CLOUD
   init_gas_cloud(r, v, a, u, du);
 #else
-  // for now gas shares the collisionless rotating disk initial condition
-  for(nn=0; nn<NUM_PARTICLES; nn++) {
-    r[nn*NUM_DIMS + 0] = NUM_CELLS*(double)(rand())/RAND_MAX;
-    r[nn*NUM_DIMS + 1] = NUM_CELLS*(double)(rand())/RAND_MAX;
-    
-    r2[0] = r[nn*NUM_DIMS + 0] - NUM_CELLS/2;
-    r2[1] = r[nn*NUM_DIMS + 1] - NUM_CELLS/2;
-    while(vector_norm(r2, 2) > 28.0){
-      r[nn*NUM_DIMS + 0] = NUM_CELLS*(double)(rand())/RAND_MAX;
-      r[nn*NUM_DIMS + 1] = NUM_CELLS*(double)(rand())/RAND_MAX;
-      r2[0] = r[nn*NUM_DIMS + 0] - NUM_CELLS/2;
-      r2[1] = r[nn*NUM_DIMS + 1] - NUM_CELLS/2;
-    }
-
-    dd = vector_norm(r2, 2);
-    vv = sqrt(2.0*4.0*M_PI*M_PI*1.4825*dd);
-    
-    v[nn*NUM_DIMS + 0] = -r2[1]*vv/dd;
-    v[nn*NUM_DIMS + 1] = r2[0]*vv/dd;
-
-    //v[nn*NUM_DIMS + 0] = 0.0;
-    //v[nn*NUM_DIMS + 1] = 0.0;
-
-    a[nn*NUM_DIMS + 0] = 0.0;
-    a[nn*NUM_DIMS + 1] = 0.0;
-  }
-
-  // gas internal energy
-  for(nn=0; nn<NUM_GAS_PARTICLES; nn++) {
-#if ISOTHERMAL
-    u[nn] = CS_ISO*CS_ISO/(GAMMA - 1.0);
-#else
-    u[nn] = U_INIT;
-#endif
-    du[nn] = 0.0;
-  }
+  init_star_disk(r, v, a, u, du);
 #endif
   cs_max = 0.0;
   v_max = 0.0;
@@ -1401,6 +1599,21 @@ int main(int argc, char *argv[])
   write_gas_cloud_profile(cloud_fp, r, 0.0, NULL);
 #endif
   steps=0;
+
+#if STAR_DISK
+  // the first pass through the loop runs with dt = 0 to compute the forces
+  // of the initial positions, then the rotation is set from them
+  int setup_pass = 1;
+  double next_disk_out = SD_OUT_DT;
+  FILE *disk_fp = fopen("stardisk.dat", "w");
+  if(!disk_fp) {
+    printf("Could not open stardisk.dat for writing.\n");
+    exit(1);
+  }
+  printf("star disk: disk/star mass %.3f, R %.1f - %.1f cells, v_K %.4f cs %.4f cells/time, outer orbit %.4f\n",
+	 SD_DISK_TO_STAR, SD_R_IN, SD_R_OUT, SD_V_K, CS_ISO, 2.0*M_PI*SD_R_OUT/SD_V_K);
+  dt = 0.0;
+#endif
   
 #if TIFF_ENABLE
   tiff_frame=0;
@@ -1661,6 +1874,16 @@ int main(int argc, char *argv[])
       }
     }
 
+#if STAR_DISK
+    if(setup_pass) {
+      v_max = set_equilibrium_rotation(r, v, a);
+      setup_pass = 0;
+      dt = fmin(DT, CFL_TARGET/(cs_max + v_max));
+      write_star_disk_profile(disk_fp, r, v, 0.0);
+      continue;
+    }
+#endif
+
     // end main simulation loop
     // ************************
     
@@ -1783,6 +2006,16 @@ int main(int argc, char *argv[])
     }
 #endif
 
+#if STAR_DISK
+    if(sim_time >= next_disk_out - 1.0e-12) {
+      write_star_disk_profile(disk_fp, r, v, sim_time);
+      next_disk_out += SD_OUT_DT;
+    }
+    if(sim_time + dt > next_disk_out) {
+      dt = next_disk_out - sim_time;
+    }
+#endif
+
     // stop at T_END, last step is shortened to land on it
     if(T_END > 0.0) {
       if(sim_time >= T_END - 1.0e-12) {
@@ -1804,6 +2037,9 @@ int main(int argc, char *argv[])
 
 #if GAS_CLOUD
   fclose(cloud_fp);
+#endif
+#if STAR_DISK
+  fclose(disk_fp);
 #endif
 
   // clean up FFTW
