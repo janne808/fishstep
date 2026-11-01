@@ -77,10 +77,11 @@ gascloud:	fishstep_gascloud
 	python3 tests/gascloud.py gascloud.dat
 
 
-# protostellar disk in equilibrium rotation, the default setup without a
-# window for two outer orbits, writes stardisk.dat
+# cooling protostellar disk, the default setup without a window for about
+# 2.5 outer orbits: with beta = 2 cooling it breaks up into spiral arms and
+# gas clumps from t ~ 40, writes stardisk.dat and stardisk_rho.bin (maps)
 fishstep_stardisk:	fishstep.c fishstep.h
-	$(CC) -o $@ fishstep.c $(OPTS) -DSDL=0 -DT_END=24.0 $(CFLAGS) $(FFTW3_OPTS)
+	$(CC) -o $@ fishstep.c $(OPTS) -DSDL=0 -DT_END=64.0 $(CFLAGS) $(FFTW3_OPTS)
 
 stardisk:	fishstep_stardisk
 	./fishstep_stardisk
