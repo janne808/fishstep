@@ -125,36 +125,69 @@
 // dark matter. The collisionless species holds a single particle, the star,
 // which moves freely under the mesh gravity of the disk. The disk surface
 // density is sigma ~ 1/r between SD_R_IN and SD_R_OUT with tanh edges of
-// width SD_EDGE_W, so in this 2D gravity (point mass force 2 G M/r) the
-// rotation curve is nearly flat. The gas is isothermal with sound speed
-// SD_ASPECT times the star's circular speed v_K = sqrt(2 G M_star), which is
-// a locally isothermal disk because v_K does not depend on radius. The
-// rotation is put into equilibrium from the gravity and pressure forces the
-// code computes for the initial positions (see set_equilibrium_rotation).
-// In 2D gravity a disk is stable when kappa^2 > 4 pi G sigma, so for this
-// profile Q_2D = M_star/(pi r^2 sigma) ~ 2 (R_out - R_in)/(SD_DISK_TO_STAR r):
-// the outer disk becomes unstable for disk to star mass ratios above ~1.8
+// width SD_EDGE_IN and SD_EDGE_OUT. The wide outer taper keeps the pressure
+// support of the outer edge small, a sharp hot edge loses it when it cools,
+// falls inwards and piles up into a ring that fragments before the disk.
+//
+// Gravity is that of a thin disk in 3D (THIN_DISK_GRAVITY): the potential of
+// Plummer softened point masses -G m/sqrt(r^2 + h^2), whose transform is
+// phi_k = -2 pi G sigma_k exp(-k h)/k, so the star's pull falls off as 1/r^2
+// and the rotation is Keplerian. It is solved on a zero padded mesh without
+// periodic images, whose slowly decaying 1/r tides would impose the square
+// symmetry of the box on the disk. With the 2D log potential of the other
+// test problems a rotating disk cannot fragment, kappa^2 > 4 pi G sigma always.
+//
+// The gas is an ideal gas started at Toomre Q = cs kappa/(pi G sigma) =
+// SD_Q_INIT and cooled on beta cooling times t_cool = SD_BETA/Omega towards
+// a floor temperature SD_U_FLOOR times the initial one, standing in for
+// stellar irradiation. Fast cooling (SD_BETA of a few) lets Q fall below ~1,
+// the disk breaks up into spiral arms and bound gas clumps collapse out of
+// them; slow cooling heats the disk by gravitational turbulence instead
+// (Gammie 2001). The rotation is put into equilibrium from the gravity and
+// pressure forces the code computes for the initial positions (see
+// set_equilibrium_rotation).
 #define STAR_DISK 1
 #ifndef SD_DISK_TO_STAR
 #define SD_DISK_TO_STAR 0.2
 #endif
-#ifndef SD_ASPECT
-#define SD_ASPECT 0.05
-#endif
-#define SD_R_IN 8.0
-#define SD_R_OUT 96.0
-#define SD_EDGE_W 3.0
-#define SD_OUT_DT 2.0
+#define SD_R_IN 16.0
+#define SD_R_OUT 80.0
+#define SD_EDGE_IN 3.0
+#define SD_EDGE_OUT 12.0
+#define SD_OUT_DT 4.0
 #define SD_STAR_MASS (1.0/(1.0 + SD_DISK_TO_STAR))
-#define SD_V_K sqrt(2.0*G_EFF*SD_STAR_MASS)
 
-#define ISOTHERMAL 1
-#define CS_ISO (SD_ASPECT*SD_V_K)
+// thin disk gravity with G = SD_G_FACTOR G_EFF and softening SD_SOFT cells,
+// the large G keeps the inner disk orbit near the maximum time step
+#define THIN_DISK_GRAVITY 1
+#define SD_G_FACTOR 20.0
+#define G_DISK (SD_G_FACTOR*G_EFF)
+#define SD_SOFT 2.0
+// circular speed of the star alone at the outer disk radius
+#define SD_V_K sqrt(G_DISK*SD_STAR_MASS/SD_R_OUT)
+
+// ideal gas with cooling
+#define ISOTHERMAL 0
+#define GAMMA (5.0/3.0)
+#ifndef SD_Q_INIT
+#define SD_Q_INIT 1.5
+#endif
+#ifndef SD_COOLING
+#define SD_COOLING 1
+#endif
+#ifndef SD_BETA
+#define SD_BETA 2.0
+#endif
+#ifndef SD_U_FLOOR
+#define SD_U_FLOOR 0.1
+#endif
+
+// gas within SD_R_ACC cells of the star is accreted onto it
+#define SD_R_ACC 8.0
 
 // pure APIC transfers: FLIP blending toward the CIC mesh velocity exerts a
-// net torque on the disk proportional to the blend fraction (0.02 loses
-// ~0.3% of the angular momentum per outer orbit), APIC keeps the rotation in
-// the affine velocity and loses ~0.05% per orbit, at the same particle noise
+// net torque on the disk proportional to the blend fraction, APIC keeps the
+// rotation in the affine velocity
 #ifndef PIC_BLEND
 #define PIC_BLEND 1.0
 #endif
@@ -172,6 +205,9 @@
 
 #ifndef STAR_DISK
 #define STAR_DISK 0
+#endif
+#ifndef THIN_DISK_GRAVITY
+#define THIN_DISK_GRAVITY 0
 #endif
 
 #define NUM_PARTICLES (NUM_DM_PARTICLES + NUM_GAS_PARTICLES)
@@ -553,8 +589,9 @@ void *compute_rho_field_thread(void *threadarg){
   // thread variables
   int ii,jj,kk;
   int s;
-  double *r, *v, *u, *aff, *sub_rho, *rho;
+  double *r, *v, *u, *aff, *sub_rho, *rho, *rho_dm;
   double *e_gas, *mx_gas, *my_gas, *ax_gas, *ay_gas;
+  const unsigned char *sink;
   double dr[2];
   double w[4], gw[4][2], d[4][2];
   double mass;
@@ -574,6 +611,7 @@ void *compute_rho_field_thread(void *threadarg){
   v=my_data->v;
   u=my_data->u;
   aff=my_data->aff;
+  sink=my_data->sink;
   sub_rho=my_data->rho;
 
   thread_id=my_data->thread_id;
@@ -584,6 +622,7 @@ void *compute_rho_field_thread(void *threadarg){
   my_gas=&sub_rho[(FIELD_GAS_MOM_Y*NUM_THREADS + thread_id)*NUM_CELLS*NUM_CELLS];
   ax_gas=&sub_rho[(FIELD_GAS_AFF_X*NUM_THREADS + thread_id)*NUM_CELLS*NUM_CELLS];
   ay_gas=&sub_rho[(FIELD_GAS_AFF_Y*NUM_THREADS + thread_id)*NUM_CELLS*NUM_CELLS];
+  rho_dm=&sub_rho[(SPECIES_DM*NUM_THREADS + thread_id)*NUM_CELLS*NUM_CELLS];
 
   // deposit each species into its own per-thread subfield
   for(s=0; s<NUM_SPECIES; s++) {
@@ -604,6 +643,14 @@ void *compute_rho_field_thread(void *threadarg){
       cic_stencil(ii, jj, dr, NUM_CELLS, c, w, gw, d);
       for(kk=0; kk<4; kk++) {
 	w[kk] *= mass;
+      }
+
+      // gas accreted by a sink is collisionless mass of the sink
+      if(s == SPECIES_GAS && sink[nn - species[SPECIES_GAS].offset]) {
+	for(kk=0; kk<4; kk++) {
+	  rho_dm[c[kk]] += w[kk];
+	}
+	continue;
       }
 
       for(kk=0; kk<4; kk++) {
@@ -914,6 +961,12 @@ void *hydro_interpolation_thread(void *threadarg){
 
     gg = nn - species[SPECIES_GAS].offset;
 
+    // accreted gas only feels gravity
+    if(my_data->sink[gg]) {
+      du[gg] = 0.0;
+      continue;
+    }
+
     // a = f/rho from the face pressure forces, divided by density on the mesh
     a[nn*NUM_DIMS + 0] += cic_interp(ax, ii, jj, dr, NUM_CELLS);
     a[nn*NUM_DIMS + 1] += cic_interp(ay, ii, jj, dr, NUM_CELLS);
@@ -1027,19 +1080,55 @@ void run_threads(void *(*fn)(void *)){
 #if STAR_DISK
 // star disk surface density profile without normalization
 static double star_disk_sigma(double rr){
-  return 0.25*(1.0 + tanh((rr - SD_R_IN)/SD_EDGE_W))*(1.0 - tanh((rr - SD_R_OUT)/SD_EDGE_W))/rr;
+  return 0.25*(1.0 + tanh((rr - SD_R_IN)/SD_EDGE_IN))*(1.0 - tanh((rr - SD_R_OUT)/SD_EDGE_OUT))/rr;
 }
 
-#define SD_R_MAX (SD_R_OUT + 6.0*SD_EDGE_W)
+#define SD_R_MAX (SD_R_OUT + 6.0*SD_EDGE_OUT)
 #define SD_NUM_TAB 8192
 
-// star at rest in the box center, gas on a sunflower pattern with radii from
-// the inverse of the tabulated enclosed mass of the surface density profile,
-// velocities are set later by set_equilibrium_rotation
+// initial specific internal energy and orbital frequency on the radius grid
+// rr = SD_R_MAX k/SD_NUM_TAB, k = 0..SD_NUM_TAB, set by init_star_disk
+static double sd_u_tab[SD_NUM_TAB + 1];
+static double sd_omega_tab[SD_NUM_TAB + 1];
+
+// linear interpolation of a radius grid table, constant beyond its ends
+static double sd_lookup(const double *tab, double rr){
+  double f = rr/SD_R_MAX*(double)(SD_NUM_TAB);
+  int kk = (int)f;
+
+  if(kk >= SD_NUM_TAB) {
+    return tab[SD_NUM_TAB];
+  }
+  f -= (double)(kk);
+  return (1.0 - f)*tab[kk] + f*tab[kk+1];
+}
+
+// sound speed of the initial temperature profile at radius rr
+static double sd_cs_init(double rr){
+  return sqrt(GAMMA*(GAMMA - 1.0)*sd_lookup(sd_u_tab, rr));
+}
+
+// uniform random number in [0, 1) from a 64 bit xorshift* generator
+static double sd_uniform(unsigned long long *state){
+  *state ^= *state >> 12;
+  *state ^= *state << 25;
+  *state ^= *state >> 27;
+  return (double)((*state*2685821657736338717ULL) >> 11)*(1.0/9007199254740992.0);
+}
+
+// star at rest in the box center, gas at radii from the inverse of the
+// tabulated enclosed mass of the surface density profile and random
+// azimuths: the azimuthal noise seeds the gravitational instability at all
+// angular scales, a smooth (golden angle) pattern would leave the weak four
+// fold anisotropy of the Cartesian mesh as its only seed. Velocities are set
+// later by set_equilibrium_rotation. The temperature is
+// set for Toomre Q = SD_Q_INIT from the Keplerian estimates
+// Omega^2 = G M(<r)/r^3 and kappa^2 = Omega^2 + 2 pi G sigma/r of the
+// enclosed star and disk mass, softened like the mesh gravity
 void init_star_disk(double *r, double *v, double *a, double *u, double *du){
   int nn, gg, kk;
-  double rr, q, th, f;
-  double golden = M_PI*(3.0 - sqrt(5.0));
+  double rr, q, th, f, sigma, menc, s3, om2, kap2, cs;
+  unsigned long long seed = 0x9e3779b97f4a7c15ULL;
   static double rad_tab[SD_NUM_TAB + 1], cdf_tab[SD_NUM_TAB + 1];
 
   // enclosed mass table, sigma ~ 1/r vanishes towards r = 0 through the taper
@@ -1049,6 +1138,19 @@ void init_star_disk(double *r, double *v, double *a, double *u, double *du){
     rad_tab[kk] = SD_R_MAX*(double)(kk)/(double)(SD_NUM_TAB);
     rr = 0.5*(rad_tab[kk] + rad_tab[kk-1]);
     cdf_tab[kk] = cdf_tab[kk-1] + 2.0*M_PI*rr*star_disk_sigma(rr)*(rad_tab[kk] - rad_tab[kk-1]);
+  }
+
+  // temperature and orbital frequency tables
+  for(kk=0; kk<=SD_NUM_TAB; kk++) {
+    rr = rad_tab[kk];
+    sigma = GAS_MASS_FRACTION*(rr > 0.0 ? star_disk_sigma(rr) : 0.0)/cdf_tab[SD_NUM_TAB];
+    menc = SD_STAR_MASS + GAS_MASS_FRACTION*cdf_tab[kk]/cdf_tab[SD_NUM_TAB];
+    s3 = pow(rr*rr + SD_SOFT*SD_SOFT, 1.5);
+    om2 = G_DISK*menc/s3;
+    kap2 = om2 + 2.0*M_PI*G_DISK*sigma*rr*rr/s3;
+    cs = SD_Q_INIT*M_PI*G_DISK*sigma/sqrt(kap2);
+    sd_omega_tab[kk] = sqrt(om2);
+    sd_u_tab[kk] = fmax(cs*cs/(GAMMA*(GAMMA - 1.0)), U_MIN);
   }
 
   for(nn=0; nn<NUM_PARTICLES; nn++) {
@@ -1073,17 +1175,113 @@ void init_star_disk(double *r, double *v, double *a, double *u, double *du){
     }
     f = (q - cdf_tab[kk-1])/(cdf_tab[kk] - cdf_tab[kk-1]);
     rr = rad_tab[kk-1] + f*(rad_tab[kk] - rad_tab[kk-1]);
-    th = golden*(double)(gg);
+    th = 2.0*M_PI*sd_uniform(&seed);
 
     r[nn*NUM_DIMS + 0] = 0.5*NUM_CELLS + rr*cos(th);
     r[nn*NUM_DIMS + 1] = 0.5*NUM_CELLS + rr*sin(th);
-    u[gg] = CS_ISO*CS_ISO/(GAMMA - 1.0);
+    u[gg] = sd_lookup(sd_u_tab, rr);
     du[gg] = 0.0;
   }
 }
 
+// beta cooling of the gas towards the floor temperature over the cooling
+// time t_cool = SD_BETA/Omega at the particle's distance from the star,
+// u_floor + (u - u_floor) exp(-dt/t_cool) solved exactly, returns the
+// radiated energy (negative where the floor heats the gas)
+double cool_star_disk(const double *r, double *u, const unsigned char *sink, double dt){
+  int nn, gg;
+  int ns = species[SPECIES_DM].offset;
+  double cx = r[ns*NUM_DIMS + 0], cy = r[ns*NUM_DIMS + 1];
+  double dx, dy, rr, u_floor, u_new, e_rad = 0.0;
+
+  for(gg=0; gg<NUM_GAS_PARTICLES; gg++) {
+    nn = species[SPECIES_GAS].offset + gg;
+    if(sink[gg]) {
+      continue;
+    }
+    dx = r[nn*NUM_DIMS + 0] - cx;
+    dy = r[nn*NUM_DIMS + 1] - cy;
+    rr = sqrt(dx*dx + dy*dy);
+    u_floor = SD_U_FLOOR*sd_lookup(sd_u_tab, rr);
+    u_new = u_floor + (u[gg] - u_floor)*exp(-dt*sd_lookup(sd_omega_tab, rr)/SD_BETA);
+    u_new = fmax(u_new, U_MIN);
+    e_rad += u[gg] - u_new;
+    u[gg] = u_new;
+  }
+  return species[SPECIES_GAS].mass*e_rad;
+}
+
+// accrete gas within SD_R_ACC of the star: the particle is moved onto the
+// star and the star and all gas it accreted take the common velocity that
+// conserves their momentum. Accreted particles then sit exactly on the star,
+// receive the same gravitational acceleration and stay with it. Returns the
+// number of particles accreted so far
+int accrete_star_disk(double *r, double *v, double *aff, unsigned char *sink){
+  int nn, gg, kk;
+  int ns = species[SPECIES_DM].offset;
+  double cx = r[ns*NUM_DIMS + 0], cy = r[ns*NUM_DIMS + 1];
+  double dx, dy, m = species[SPECIES_GAS].mass;
+  double px, py, mg;
+  int n_acc = 0, n_new = 0;
+
+  for(gg=0; gg<NUM_GAS_PARTICLES; gg++) {
+    n_acc += sink[gg];
+  }
+  mg = species[SPECIES_DM].mass + m*(double)(n_acc);
+  px = mg*v[ns*NUM_DIMS + 0];
+  py = mg*v[ns*NUM_DIMS + 1];
+
+  for(gg=0; gg<NUM_GAS_PARTICLES; gg++) {
+    if(sink[gg]) {
+      continue;
+    }
+    nn = species[SPECIES_GAS].offset + gg;
+    dx = r[nn*NUM_DIMS + 0] - cx;
+    dy = r[nn*NUM_DIMS + 1] - cy;
+    // the box is periodic but the star stays far from the boundary
+    if(dx*dx + dy*dy < SD_R_ACC*SD_R_ACC) {
+      sink[gg] = 1;
+      px += m*v[nn*NUM_DIMS + 0];
+      py += m*v[nn*NUM_DIMS + 1];
+      mg += m;
+      for(kk=0; kk<4; kk++) {
+	aff[4*gg + kk] = 0.0;
+      }
+      n_new++;
+    }
+  }
+
+  if(n_new > 0) {
+    v[ns*NUM_DIMS + 0] = px/mg;
+    v[ns*NUM_DIMS + 1] = py/mg;
+    for(gg=0; gg<NUM_GAS_PARTICLES; gg++) {
+      if(sink[gg]) {
+	nn = species[SPECIES_GAS].offset + gg;
+	r[nn*NUM_DIMS + 0] = cx;
+	r[nn*NUM_DIMS + 1] = cy;
+	v[nn*NUM_DIMS + 0] = v[ns*NUM_DIMS + 0];
+	v[nn*NUM_DIMS + 1] = v[ns*NUM_DIMS + 1];
+      }
+    }
+  }
+  return n_acc + n_new;
+}
+
+// append the gas surface density map as NUM_CELLS^2 floats, one frame per
+// profile block of stardisk.dat
+void write_star_disk_map(FILE *fp, const double *rho_gas){
+  static float frame[NUM_CELLS*NUM_CELLS];
+  int nn;
+
+  for(nn=0; nn<NUM_CELLS*NUM_CELLS; nn++) {
+    frame[nn] = (float)rho_gas[nn];
+  }
+  fwrite(frame, sizeof(float), NUM_CELLS*NUM_CELLS, fp);
+  fflush(fp);
+}
+
 // bins of half a cell out to SD_R_MAX, as an integer constant expression
-#define SD_NUM_BINS (2*((int)SD_R_OUT + 6*(int)SD_EDGE_W) + 2)
+#define SD_NUM_BINS (2*((int)SD_R_OUT + 6*(int)SD_EDGE_OUT) + 2)
 
 // circular velocities in equilibrium with the accelerations a of the initial
 // positions: the gas acceleration towards the star averaged over radial bins
@@ -1161,21 +1359,23 @@ double set_equilibrium_rotation(double *r, double *v, const double *a){
 }
 
 // radial profile of the gas disk around the star in bins of one cell:
-// surface density, mean azimuthal and radial velocity relative to the star
-// and the rms radial velocity, header with the star state and the total
-// angular momentum about the center of mass including the APIC spin
-void write_star_disk_profile(FILE *fp, const double *r, const double *v, const double *aff, double t){
+// surface density, mean azimuthal and radial velocity relative to the star,
+// the rms radial velocity and the mass weighted sound speed, header with the
+// star state, the total angular momentum about the center of mass including
+// the APIC spin, the gas thermal energy and the energy radiated so far
+void write_star_disk_profile(FILE *fp, const double *r, const double *v, const double *aff, const double *u,
+			     const unsigned char *sink, double e_rad, double t){
   int nn, bb;
   int ns = species[SPECIES_DM].offset;
   double cx = r[ns*NUM_DIMS + 0], cy = r[ns*NUM_DIMS + 1];
   double svx = v[ns*NUM_DIMS + 0], svy = v[ns*NUM_DIMS + 1];
   double dx, dy, dvx, dvy, rr, m, mtot = 0.0;
-  double gx = 0.0, gy = 0.0, gvx = 0.0, gvy = 0.0, lz = 0.0;
-  enum { NB = (int)SD_R_OUT + 6*(int)SD_EDGE_W + 1 };
-  double mass[NB], vphi[NB], vr[NB], vr2[NB];
+  double gx = 0.0, gy = 0.0, gvx = 0.0, gvy = 0.0, lz = 0.0, e_th = 0.0, m_acc = 0.0;
+  enum { NB = (int)SD_R_OUT + 6*(int)SD_EDGE_OUT + 1 };
+  double mass[NB], vphi[NB], vr[NB], vr2[NB], csb[NB];
 
   for(bb=0; bb<NB; bb++) {
-    mass[bb] = vphi[bb] = vr[bb] = vr2[bb] = 0.0;
+    mass[bb] = vphi[bb] = vr[bb] = vr2[bb] = csb[bb] = 0.0;
   }
 
   // center of mass position and velocity
@@ -1208,22 +1408,34 @@ void write_star_disk_profile(FILE *fp, const double *r, const double *v, const d
       vphi[bb] += m*(dx*dvy - dy*dvx)/rr;
       vr[bb] += m*(dx*dvx + dy*dvy)/rr;
       vr2[bb] += m*(dx*dvx + dy*dvy)*(dx*dvx + dy*dvy)/(rr*rr);
+      csb[bb] += m*sqrt(GAMMA*(GAMMA - 1.0)*u[nn - species[SPECIES_GAS].offset]);
+    }
+    if(!sink[nn - species[SPECIES_GAS].offset]) {
+      e_th += m*u[nn - species[SPECIES_GAS].offset];
+    }
+    else {
+      m_acc += m;
     }
   }
 
+  // v_K is the star's circular speed at R_out, cs the initial sound speed
+  // in the middle of the disk
   fprintf(fp, "# t %.6f star_x %.6f star_y %.6f star_vx %.6e star_vy %.6e cm_x %.6f cm_y %.6f Lz %.10e "
-	  "R_in %.3f R_out %.3f v_K %.6f cs %.6f disk_to_star %.4f\n",
-	  t, cx, cy, svx, svy, gx, gy, lz, SD_R_IN, SD_R_OUT, SD_V_K, CS_ISO, SD_DISK_TO_STAR);
+	  "R_in %.3f R_out %.3f edge_out %.3f v_K %.6f cs %.6f disk_to_star %.4f G %.6f gamma %.6f beta %.4f "
+	  "cooling %d Q_init %.4f u_floor %.4f E_th %.10e E_rad %.10e M_acc %.6e\n",
+	  t, cx, cy, svx, svy, gx, gy, lz, SD_R_IN, SD_R_OUT, SD_EDGE_OUT, SD_V_K, sd_cs_init(0.5*(SD_R_IN + SD_R_OUT)),
+	  SD_DISK_TO_STAR, G_DISK, GAMMA, SD_BETA, SD_COOLING, SD_Q_INIT, SD_U_FLOOR, e_th, e_rad, m_acc);
   for(bb=0; bb<NB; bb++) {
     if(mass[bb] > 0.0) {
-      fprintf(fp, "%.2f %.8e %.6e %.6e %.6e\n", bb + 0.5, mass[bb]/(M_PI*(double)(2*bb + 1)),
-	      vphi[bb]/mass[bb], vr[bb]/mass[bb], sqrt(vr2[bb]/mass[bb]));
+      fprintf(fp, "%.2f %.8e %.6e %.6e %.6e %.6e\n", bb + 0.5, mass[bb]/(M_PI*(double)(2*bb + 1)),
+	      vphi[bb]/mass[bb], vr[bb]/mass[bb], sqrt(vr2[bb]/mass[bb]), csb[bb]/mass[bb]);
     }
   }
   fprintf(fp, "\n\n");
   fflush(fp);
 
-  printf("disk t: %.3f star: (%.4f, %.4f) v (%.3e, %.3e) Lz %.8e\n", t, cx, cy, svx, svy, lz);
+  printf("disk t: %.3f star: (%.4f, %.4f) v (%.3e, %.3e) Lz %.8e E_th %.6e E_rad %.6e M_acc %.4e\n",
+	 t, cx, cy, svx, svy, lz, e_th, e_rad, m_acc);
 }
 #endif
 
@@ -1476,6 +1688,7 @@ int main(int argc, char *argv[])
   
   double *rho, *sub_rho, *rho_species;
   double *u, *du, *aff;
+  unsigned char *sink;
   double *press, *du_mesh, *gas_vel, *gas_acc;
   double cs_max, v_max, e_thermal;
   double p_res, e_flip_loss = 0.0, e_work_res = 0.0;
@@ -1581,7 +1794,8 @@ int main(int argc, char *argv[])
   u=(double *)malloc(NUM_GAS_PARTICLES*sizeof(double));
   du=(double *)malloc(NUM_GAS_PARTICLES*sizeof(double));
   aff=(double *)calloc(4*(NUM_GAS_PARTICLES > 0 ? NUM_GAS_PARTICLES : 1), sizeof(double));
-  if(!u || !du || !aff){
+  sink=(unsigned char *)calloc(NUM_GAS_PARTICLES > 0 ? NUM_GAS_PARTICLES : 1, sizeof(unsigned char));
+  if(!u || !du || !aff || !sink){
     printf("Out of memory: u or du not allocated.\n");
     exit(1);
   }
@@ -1645,7 +1859,9 @@ int main(int argc, char *argv[])
   
   // compute gravitational green's function in k-space for the 5 point
   // discrete laplacian, FFT bin ii holds wavenumber ii for ii <= N/2 and
-  // ii - N above, the k = 0 mean density mode is dropped (periodic box)
+  // ii - N above, the k = 0 mean density mode is dropped (periodic box).
+  // The solve multiplies by 4 pi G_EFF, so -1/K^2 with K^2 = 4 dd_k gives
+  // lap(phi) = 4 pi G_EFF rho. Thin disk gravity is solved separately below
   for(jj=0; jj<NUM_CELLS; jj++) {
     for(ii=0; ii<NUM_CELLS; ii++) {
       k_x = 2.0*M_PI*(double)(ii <= NUM_CELLS/2 ? ii : ii - NUM_CELLS)/(double)(NUM_CELLS);
@@ -1680,6 +1896,43 @@ int main(int argc, char *argv[])
     exit(1);
   }
 
+#if THIN_DISK_GRAVITY
+  // isolated thin disk gravity (Hockney and Eastwood): the density is zero
+  // padded to a mesh of twice the size and convolved with the Plummer
+  // softened point mass potential -G_DISK/sqrt(r^2 + h^2), the transform of
+  // phi_k = -2 pi G_DISK exp(-k h) sigma_k/k, tabulated with the distances
+  // wrapped on the padded mesh. No periodic images act on the disk
+  fftw_complex *pad_in, *pad_hat, *pad_out, *kern_hat;
+  fftw_plan pad_fwd, pad_bwd;
+  const int NP = 2*NUM_CELLS;
+  double pdx, pdy;
+
+  pad_in = (fftw_complex*) fftw_malloc(sizeof(fftw_complex)*NP*NP);
+  pad_hat = (fftw_complex*) fftw_malloc(sizeof(fftw_complex)*NP*NP);
+  pad_out = (fftw_complex*) fftw_malloc(sizeof(fftw_complex)*NP*NP);
+  kern_hat = (fftw_complex*) fftw_malloc(sizeof(fftw_complex)*NP*NP);
+  if(!pad_in || !pad_hat || !pad_out || !kern_hat){
+    printf("Out of memory: padded gravity mesh not allocated.\n");
+    exit(1);
+  }
+  pad_fwd = fftw_plan_dft_2d(NP, NP, pad_in, pad_hat, FFTW_FORWARD, FFTW_ESTIMATE);
+  pad_bwd = fftw_plan_dft_2d(NP, NP, pad_hat, pad_out, FFTW_BACKWARD, FFTW_ESTIMATE);
+  if(!pad_fwd || !pad_bwd){
+    printf("FFTW padded gravity plans failed.\n");
+    exit(1);
+  }
+  for(jj=0; jj<NP; jj++) {
+    for(ii=0; ii<NP; ii++) {
+      pdx = (double)(ii <= NP/2 ? ii : NP - ii);
+      pdy = (double)(jj <= NP/2 ? jj : NP - jj);
+      pad_in[jj*NP + ii][0] = -G_DISK/sqrt(pdx*pdx + pdy*pdy + SD_SOFT*SD_SOFT);
+      pad_in[jj*NP + ii][1] = 0.0;
+    }
+  }
+  fftw_execute(pad_fwd);
+  memcpy(kern_hat, pad_hat, sizeof(fftw_complex)*NP*NP);
+#endif
+
   // start timer
   clock_gettime(CLOCK_MONOTONIC, &time1);
 
@@ -1707,13 +1960,18 @@ int main(int argc, char *argv[])
   // of the initial positions, then the rotation is set from them
   int setup_pass = 1;
   double next_disk_out = SD_OUT_DT;
+  double e_rad = 0.0;
   FILE *disk_fp = fopen("stardisk.dat", "w");
-  if(!disk_fp) {
-    printf("Could not open stardisk.dat for writing.\n");
+  FILE *map_fp = fopen("stardisk_rho.bin", "wb");
+  if(!disk_fp || !map_fp) {
+    printf("Could not open stardisk.dat or stardisk_rho.bin for writing.\n");
     exit(1);
   }
-  printf("star disk: disk/star mass %.3f, R %.1f - %.1f cells, v_K %.4f cs %.4f cells/time, outer orbit %.4f\n",
-	 SD_DISK_TO_STAR, SD_R_IN, SD_R_OUT, SD_V_K, CS_ISO, 2.0*M_PI*SD_R_OUT/SD_V_K);
+  printf("star disk: disk/star mass %.3f, R %.1f - %.1f cells, Q_init %.2f, cooling %d beta %.2f u_floor %.2f\n"
+	 "           cs %.4f and orbit %.4f at R_in, cs %.4f and orbit %.4f at R_out\n",
+	 SD_DISK_TO_STAR, SD_R_IN, SD_R_OUT, SD_Q_INIT, SD_COOLING, SD_BETA, SD_U_FLOOR,
+	 sd_cs_init(SD_R_IN + SD_EDGE_IN), 2.0*M_PI/sd_lookup(sd_omega_tab, SD_R_IN),
+	 sd_cs_init(SD_R_OUT), 2.0*M_PI/sd_lookup(sd_omega_tab, SD_R_OUT));
   dt = 0.0;
 #endif
   
@@ -1806,6 +2064,7 @@ int main(int argc, char *argv[])
       thread_data_array[nn].v=v;
       thread_data_array[nn].u=u;
       thread_data_array[nn].aff=aff;
+      thread_data_array[nn].sink=sink;
       thread_data_array[nn].rho=sub_rho;
 
       thread_rc=pthread_create(&threads[nn], &attr, compute_rho_field_thread, (void *) &thread_data_array[nn]);
@@ -1871,6 +2130,29 @@ int main(int argc, char *argv[])
       }
     }
     
+#if THIN_DISK_GRAVITY
+    // isolated solve: zero padded density convolved with the softened
+    // point mass potential, rho holds the mass per cell
+    memset(pad_in, 0, sizeof(fftw_complex)*NP*NP);
+    for(jj=0; jj<NUM_CELLS; jj++) {
+      for(ii=0; ii<NUM_CELLS; ii++) {
+	pad_in[jj*NP + ii][0] = rho[jj*NUM_CELLS + ii];
+      }
+    }
+    fftw_execute(pad_fwd);
+    for(ii=0; ii<NP*NP; ii++) {
+      double re = pad_hat[ii][0]*kern_hat[ii][0] - pad_hat[ii][1]*kern_hat[ii][1];
+      double im = pad_hat[ii][0]*kern_hat[ii][1] + pad_hat[ii][1]*kern_hat[ii][0];
+      pad_hat[ii][0] = re;
+      pad_hat[ii][1] = im;
+    }
+    fftw_execute(pad_bwd);
+    for(jj=0; jj<NUM_CELLS; jj++) {
+      for(ii=0; ii<NUM_CELLS; ii++) {
+	phi[jj*NUM_CELLS + ii] = pad_out[jj*NP + ii][0]/((double)(NP)*(double)(NP));
+      }
+    }
+#else
     // compute rho_hat
     fftw_execute(rho_plan);
 
@@ -1889,6 +2171,7 @@ int main(int argc, char *argv[])
     for(ii=0; ii<NUM_CELLS*NUM_CELLS; ii++) {
       phi[ii] = 1.0/(NUM_CELLS) * phi_complex[ii][0];
     }
+#endif
 
     // create acceleration interpolation threads
     pthread_attr_init(&attr);
@@ -1939,6 +2222,7 @@ int main(int argc, char *argv[])
       thread_data_array[nn].vel_mesh=gas_vel;
       thread_data_array[nn].du_mesh=du_mesh;
       thread_data_array[nn].aff=aff;
+      thread_data_array[nn].sink=sink;
     }
     run_threads(hydro_interpolation_thread);
     for(nn=0;nn<NUM_THREADS;nn++){
@@ -1983,7 +2267,8 @@ int main(int argc, char *argv[])
       v_max = set_equilibrium_rotation(r, v, a);
       setup_pass = 0;
       dt = fmin(DT, CFL_TARGET/(cs_max + v_max));
-      write_star_disk_profile(disk_fp, r, v, aff, 0.0);
+      write_star_disk_profile(disk_fp, r, v, aff, u, sink, e_rad, 0.0);
+      write_star_disk_map(map_fp, &rho_species[FIELD_RHO_GAS*NUM_CELLS*NUM_CELLS]);
       continue;
     }
 #endif
@@ -2086,6 +2371,15 @@ int main(int argc, char *argv[])
       // reset steps variable
       steps = -1;
     }
+#if STAR_DISK
+#if SD_COOLING
+    // radiative cooling over the completed step
+    e_rad += cool_star_disk(r, u, sink, dt);
+#endif
+    // accretion of gas onto the star
+    accrete_star_disk(r, v, aff, sink);
+#endif
+
     // adaptive time step for the next step from the gas CFL condition,
     // changed only between full steps so both half kicks use the same dt
     sim_time += dt;
@@ -2112,7 +2406,8 @@ int main(int argc, char *argv[])
 
 #if STAR_DISK
     if(sim_time >= next_disk_out - 1.0e-12) {
-      write_star_disk_profile(disk_fp, r, v, aff, sim_time);
+      write_star_disk_profile(disk_fp, r, v, aff, u, sink, e_rad, sim_time);
+      write_star_disk_map(map_fp, &rho_species[FIELD_RHO_GAS*NUM_CELLS*NUM_CELLS]);
       next_disk_out += SD_OUT_DT;
     }
     if(sim_time + dt > next_disk_out) {
@@ -2144,9 +2439,18 @@ int main(int argc, char *argv[])
 #endif
 #if STAR_DISK
   fclose(disk_fp);
+  fclose(map_fp);
 #endif
 
   // clean up FFTW
+#if THIN_DISK_GRAVITY
+  fftw_destroy_plan(pad_fwd);
+  fftw_destroy_plan(pad_bwd);
+  fftw_free(pad_in);
+  fftw_free(pad_hat);
+  fftw_free(pad_out);
+  fftw_free(kern_hat);
+#endif
   fftw_destroy_plan(rho_plan);
 #if FFTW3_THREADS  
   fftw_cleanup_threads();

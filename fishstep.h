@@ -78,6 +78,10 @@ struct thread_data{
   // x_p is v_p + B D^-1 (x - x_p) with D = sum_c w_c (x_c - x_p)(x_c - x_p)^T
   double *aff;
 
+  // nonzero for gas particles accreted by a sink (the star of the disk
+  // problem): they move with it and deposit into the collisionless density
+  unsigned char *sink;
+
   // summed mesh fields, gas pressure acceleration, mass weighted gas
   // velocity including the APIC affine momentum (first two of the four
   // velocity components) and specific internal energy rate on the mesh
