@@ -191,7 +191,7 @@ def main():
             floor = np.percentile(maps[0][maps[0] > 0], 20)
             ax.imshow(np.log10(np.maximum(img, floor)), origin="lower", cmap="magma",
                       extent=(lo_x - cx, lo_x - cx + img.shape[1], lo_y - cy, lo_y - cy + img.shape[0]))
-            for (x0, y0, rr, m) in clump_sets[k]:
+            for (x0, y0, rr, m, *_) in clump_sets[k]:
                 ax.plot(x0 - cx, y0 - cy, "o", mfc="none", mec="cyan", ms=8, mew=1.2)
         ax.set_title(f"t = {meta['t']:g}, clumps {len(clump_sets[k])}")
         ax.set_xlabel("x - x_star [cells]")
