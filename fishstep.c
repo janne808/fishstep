@@ -50,15 +50,21 @@
 // number of cells per dimension
 #define NUM_CELLS 512
 
-// test problems, both 0: protostellar gas disk around a central star
+// test problems, all 0: protostellar gas disk around a central star
 // SHOCK_TUBE 1: Sod shock tube along x, gas only, no gravity, writes shocktube.dat
 // GAS_CLOUD 1: polytropic self-gravitating gas cylinder in hydrostatic
 // equilibrium, writes radial profiles to gascloud.dat
+// DUSTY_BOX 1: uniform gas and dust streaming through each other, the drag
+// test of Laibe and Price (2011), writes dustybox.dat. With DB_WAVE > 0 a
+// sound wave in the dusty gas instead (DUSTYWAVE)
 #ifndef SHOCK_TUBE
 #define SHOCK_TUBE 0
 #endif
 #ifndef GAS_CLOUD
 #define GAS_CLOUD 0
+#endif
+#ifndef DUSTY_BOX
+#define DUSTY_BOX 0
 #endif
 
 #if SHOCK_TUBE
@@ -119,6 +125,60 @@
 // smaller time steps, it is a spatial instability not yet understood
 #ifndef APIC
 #define APIC 0
+#endif
+#elif DUSTY_BOX
+// uniform gas at rest and uniform dust moving through it with DB_V0 along x,
+// no gravity and no pressure gradient, so only the drag acts: the center of
+// mass velocity stays constant and the relative velocity decays as
+// exp(-(1 + eps) t/t_s) with the dust to gas ratio eps, the kinetic energy
+// lost heats the gas. Regular lattices of DB_PPC_X by DB_PPC_Y gas and
+// dust particles per cell
+//
+// DB_WAVE > 0: DUSTYWAVE, gas and dust at rest on average carry a sound wave
+// of DB_WAVE wavelengths along x, both displaced by the same amplitude
+// DB_AMP and moving with the gas velocity of a wave travelling to +x. The
+// linear solution of the coupled waves is computed by tests/dustywave.py
+// from the Fourier amplitudes written to dustywave.dat
+#define DB_PPC_X 2
+#define DB_PPC_Y 2
+#ifndef DB_WAVE
+#define DB_WAVE 0
+#endif
+#if DB_WAVE
+#define DB_CS 10.0
+#define DB_V0 0.0
+#define DB_AMP 1.0e-3
+#define DB_K (2.0*M_PI*DB_WAVE/(double)(NUM_CELLS))
+#else
+#define DB_CS 1.0
+#define DB_V0 1.0
+#endif
+#ifndef DB_EPS
+#define DB_EPS 1.0
+#endif
+// constant dust stopping time
+#ifndef DUST_TS
+#define DUST_TS 0.05
+#endif
+
+#define NUM_DM_PARTICLES 0
+#define NUM_GAS_PARTICLES (NUM_CELLS*NUM_CELLS*DB_PPC_X*DB_PPC_Y)
+#define NUM_DUST_PARTICLES (NUM_CELLS*NUM_CELLS*DB_PPC_X*DB_PPC_Y)
+#define GAS_MASS_FRACTION 1.0
+#define DUST_TO_GAS DB_EPS
+#define GRAVITY 0
+#ifndef T_END
+#if DB_WAVE
+// one sound crossing of a wavelength
+#define T_END (NUM_CELLS/(DB_WAVE*DB_CS))
+#else
+#define T_END 0.5
+#endif
+#endif
+
+// pure APIC transfers
+#ifndef PIC_BLEND
+#define PIC_BLEND 1.0
 #endif
 #else
 // star system formation: a self-gravitating gas disk around a protostar, no
@@ -200,6 +260,21 @@
 #define NUM_GAS_PARTICLES 1000000
 #define GAS_MASS_FRACTION (SD_DISK_TO_STAR/(1.0 + SD_DISK_TO_STAR))
 
+// dust in the disk (SD_DUST 1): superparticles placed like the gas and
+// rotating with it, DUST_TO_GAS of the gas mass. Small grains in the Epstein
+// regime of a thin disk have the Stokes number St = Omega t_s =
+// pi a rho_s/(2 sigma_gas), independent of the temperature; DUST_ST is St of
+// the grain size in the initial gas surface density in the middle of the disk
+#ifndef SD_DUST
+#define SD_DUST 0
+#endif
+#if SD_DUST
+#define NUM_DUST_PARTICLES 500000
+#endif
+#ifndef DUST_ST
+#define DUST_ST 1.0
+#endif
+
 // self-gravity on, run until the window is closed unless T_END is given
 #define GRAVITY 1
 #ifndef T_END
@@ -214,7 +289,19 @@
 #define THIN_DISK_GRAVITY 0
 #endif
 
-#define NUM_PARTICLES (NUM_DM_PARTICLES + NUM_GAS_PARTICLES)
+// dust superparticles, DUST_TO_GAS of the gas mass in total. A positive
+// DUST_TS is a constant stopping time, otherwise the test problem sets it
+#ifndef NUM_DUST_PARTICLES
+#define NUM_DUST_PARTICLES 0
+#endif
+#ifndef DUST_TO_GAS
+#define DUST_TO_GAS 0.01
+#endif
+#ifndef DUST_TS
+#define DUST_TS 0.0
+#endif
+
+#define NUM_PARTICLES (NUM_DM_PARTICLES + NUM_GAS_PARTICLES + NUM_DUST_PARTICLES)
 
 // display both species in separate color channels instead of total density
 #define DISPLAY_SPECIES 1
@@ -229,6 +316,7 @@
 // particle mass per species
 #define DM_MASS ((NUM_DM_PARTICLES) > 0 ? (1.0 - GAS_MASS_FRACTION)/(double)(NUM_DM_PARTICLES) : 0.0)
 #define GAS_MASS ((NUM_GAS_PARTICLES) > 0 ? GAS_MASS_FRACTION/(double)(NUM_GAS_PARTICLES) : 0.0)
+#define DUST_MASS ((NUM_DUST_PARTICLES) > 0 ? DUST_TO_GAS*GAS_MASS_FRACTION/(double)(NUM_DUST_PARTICLES) : 0.0)
 
 // size of the per-field, per-thread mesh subfield buffer
 #define SUB_FIELD_SIZE (NUM_GRID_FIELDS*NUM_THREADS*NUM_CELLS*NUM_CELLS)
@@ -319,11 +407,23 @@
 
 struct thread_data thread_data_array[NUM_THREADS];
 
-// species table, dark matter first, gas after it
+// species table, dark matter first, gas after it, dust last
 struct species_info species[NUM_SPECIES] = {
-  [SPECIES_DM]  = {0, NUM_DM_PARTICLES, DM_MASS},
-  [SPECIES_GAS] = {NUM_DM_PARTICLES, NUM_GAS_PARTICLES, GAS_MASS},
+  [SPECIES_DM]   = {0, NUM_DM_PARTICLES, DM_MASS},
+  [SPECIES_GAS]  = {NUM_DM_PARTICLES, NUM_GAS_PARTICLES, GAS_MASS},
+  [SPECIES_DUST] = {NUM_DM_PARTICLES + NUM_GAS_PARTICLES, NUM_DUST_PARTICLES, DUST_MASS},
 };
+
+// mass of particle nn
+static inline double particle_mass(int nn){
+  if(nn < species[SPECIES_GAS].offset) {
+    return species[SPECIES_DM].mass;
+  }
+  if(nn < species[SPECIES_DUST].offset) {
+    return species[SPECIES_GAS].mass;
+  }
+  return species[SPECIES_DUST].mass;
+}
 
 /* structure for RGB color */
 struct color{
@@ -594,8 +694,8 @@ void *compute_rho_field_thread(void *threadarg){
   int ii,jj,kk;
   int s;
   double *r, *v, *u, *aff, *sub_rho, *rho, *rho_dm;
-  double *e_gas, *mx_gas, *my_gas, *ax_gas, *ay_gas;
-  const unsigned char *sink;
+  double *e_gas, *mx_gas, *my_gas, *ax_gas, *ay_gas, *mx_dust, *my_dust, *ax_dust, *ay_dust;
+  const unsigned char *sink, *dsink;
   double dr[2];
   double w[4], gw[4][2], d[4][2];
   double mass;
@@ -616,6 +716,7 @@ void *compute_rho_field_thread(void *threadarg){
   u=my_data->u;
   aff=my_data->aff;
   sink=my_data->sink;
+  dsink=my_data->dsink;
   sub_rho=my_data->rho;
 
   thread_id=my_data->thread_id;
@@ -626,6 +727,10 @@ void *compute_rho_field_thread(void *threadarg){
   my_gas=&sub_rho[(FIELD_GAS_MOM_Y*NUM_THREADS + thread_id)*NUM_CELLS*NUM_CELLS];
   ax_gas=&sub_rho[(FIELD_GAS_AFF_X*NUM_THREADS + thread_id)*NUM_CELLS*NUM_CELLS];
   ay_gas=&sub_rho[(FIELD_GAS_AFF_Y*NUM_THREADS + thread_id)*NUM_CELLS*NUM_CELLS];
+  mx_dust=&sub_rho[(FIELD_DUST_MOM_X*NUM_THREADS + thread_id)*NUM_CELLS*NUM_CELLS];
+  my_dust=&sub_rho[(FIELD_DUST_MOM_Y*NUM_THREADS + thread_id)*NUM_CELLS*NUM_CELLS];
+  ax_dust=&sub_rho[(FIELD_DUST_AFF_X*NUM_THREADS + thread_id)*NUM_CELLS*NUM_CELLS];
+  ay_dust=&sub_rho[(FIELD_DUST_AFF_Y*NUM_THREADS + thread_id)*NUM_CELLS*NUM_CELLS];
   rho_dm=&sub_rho[(SPECIES_DM*NUM_THREADS + thread_id)*NUM_CELLS*NUM_CELLS];
 
   // deposit each species into its own per-thread subfield
@@ -649,8 +754,9 @@ void *compute_rho_field_thread(void *threadarg){
 	w[kk] *= mass;
       }
 
-      // gas accreted by a sink is collisionless mass of the sink
-      if(s == SPECIES_GAS && sink[nn - species[SPECIES_GAS].offset]) {
+      // gas and dust accreted by a sink are collisionless mass of the sink
+      if((s == SPECIES_GAS && sink[nn - species[SPECIES_GAS].offset]) ||
+	 (s == SPECIES_DUST && dsink[nn - species[SPECIES_DUST].offset])) {
 	for(kk=0; kk<4; kk++) {
 	  rho_dm[c[kk]] += w[kk];
 	}
@@ -674,6 +780,17 @@ void *compute_rho_field_thread(void *threadarg){
 	    ax_gas[c[kk]] += mass*(bp[0]*gw[kk][0] + bp[1]*gw[kk][1]);
 	    ay_gas[c[kk]] += mass*(bp[2]*gw[kk][0] + bp[3]*gw[kk][1]);
 	  }
+	}
+      }
+
+      // dust momentum for the drag, with its APIC affine momentum
+      if(s == SPECIES_DUST) {
+	bp = &my_data->daff[4*(nn - species[SPECIES_DUST].offset)];
+	for(kk=0; kk<4; kk++) {
+	  mx_dust[c[kk]] += w[kk]*v[nn*NUM_DIMS + 0];
+	  my_dust[c[kk]] += w[kk]*v[nn*NUM_DIMS + 1];
+	  ax_dust[c[kk]] += mass*(bp[0]*gw[kk][0] + bp[1]*gw[kk][1]);
+	  ay_dust[c[kk]] += mass*(bp[2]*gw[kk][0] + bp[3]*gw[kk][1]);
 	}
       }
     }
@@ -1097,6 +1214,10 @@ static double sd_u_tab[SD_NUM_TAB + 1];
 static double sd_ufloor_tab[SD_NUM_TAB + 1];
 static double sd_omega_tab[SD_NUM_TAB + 1];
 
+// gas surface density of the initial profile in the middle of the disk, the
+// reference of DUST_ST, set by init_star_disk
+static double sd_sigma_ref;
+
 // linear interpolation of a radius grid table, constant beyond its ends
 static double sd_lookup(const double *tab, double rr){
   double f = rr/SD_R_MAX*(double)(SD_NUM_TAB);
@@ -1163,6 +1284,7 @@ void init_star_disk(double *r, double *v, double *a, double *u, double *du){
   }
   r_ref = 0.5*(SD_R_IN + SD_R_OUT);
   cs_ref = SD_Q_FLOOR*sd_lookup(qcs_tab, r_ref);
+  sd_sigma_ref = GAS_MASS_FRACTION*star_disk_sigma(r_ref)/cdf_tab[SD_NUM_TAB];
   for(kk=0; kk<=SD_NUM_TAB; kk++) {
     // the floor is held constant inside the accretion radius
     cs = cs_ref*pow(fmax(rad_tab[kk], SD_R_ACC)/r_ref, -0.25);
@@ -1200,6 +1322,23 @@ void init_star_disk(double *r, double *v, double *a, double *u, double *du){
     u[gg] = sd_lookup(sd_u_tab, rr);
     du[gg] = 0.0;
   }
+
+  // dust follows the gas surface density with its own random azimuths
+  kk = 1;
+  seed = 0x2545f4914f6cdd1dULL;
+  for(gg=0; gg<NUM_DUST_PARTICLES; gg++) {
+    nn = species[SPECIES_DUST].offset + gg;
+    q = ((double)(gg) + 0.5)/(double)(NUM_DUST_PARTICLES)*cdf_tab[SD_NUM_TAB];
+    while(cdf_tab[kk] < q) {
+      kk++;
+    }
+    f = (q - cdf_tab[kk-1])/(cdf_tab[kk] - cdf_tab[kk-1]);
+    rr = rad_tab[kk-1] + f*(rad_tab[kk] - rad_tab[kk-1]);
+    th = 2.0*M_PI*sd_uniform(&seed);
+
+    r[nn*NUM_DIMS + 0] = 0.5*NUM_CELLS + rr*cos(th);
+    r[nn*NUM_DIMS + 1] = 0.5*NUM_CELLS + rr*sin(th);
+  }
 }
 
 // beta cooling of the gas towards the floor temperature over the cooling
@@ -1229,56 +1368,68 @@ double cool_star_disk(const double *r, double *u, const unsigned char *sink, dou
   return species[SPECIES_GAS].mass*e_rad;
 }
 
-// accrete gas within SD_R_ACC of the star: the particle is moved onto the
-// star and the star and all gas it accreted take the common velocity that
-// conserves their momentum. Accreted particles then sit exactly on the star,
-// receive the same gravitational acceleration and stay with it. Returns the
-// number of particles accreted so far
-int accrete_star_disk(double *r, double *v, double *aff, unsigned char *sink){
-  int nn, gg, kk;
+// accrete gas and dust within SD_R_ACC of the star: the particle is moved
+// onto the star and the star and all particles it accreted take the common
+// velocity that conserves their momentum. Accreted particles then sit exactly
+// on the star, receive the same gravitational acceleration and stay with it.
+// Returns the number of particles accreted so far
+int accrete_star_disk(double *r, double *v, double *aff, unsigned char *sink, unsigned char *dsink, double *daff){
+  int nn, gg, kk, s;
   int ns = species[SPECIES_DM].offset;
   double cx = r[ns*NUM_DIMS + 0], cy = r[ns*NUM_DIMS + 1];
-  double dx, dy, m = species[SPECIES_GAS].mass;
+  double dx, dy, m;
   double px, py, mg;
   int n_acc = 0, n_new = 0;
+  unsigned char *flag;
 
-  for(gg=0; gg<NUM_GAS_PARTICLES; gg++) {
-    n_acc += sink[gg];
+  mg = species[SPECIES_DM].mass;
+  for(s=SPECIES_GAS; s<=SPECIES_DUST; s++) {
+    flag = s == SPECIES_GAS ? sink : dsink;
+    for(gg=0; gg<species[s].count; gg++) {
+      n_acc += flag[gg];
+      mg += flag[gg]*species[s].mass;
+    }
   }
-  mg = species[SPECIES_DM].mass + m*(double)(n_acc);
   px = mg*v[ns*NUM_DIMS + 0];
   py = mg*v[ns*NUM_DIMS + 1];
 
-  for(gg=0; gg<NUM_GAS_PARTICLES; gg++) {
-    if(sink[gg]) {
-      continue;
-    }
-    nn = species[SPECIES_GAS].offset + gg;
-    dx = r[nn*NUM_DIMS + 0] - cx;
-    dy = r[nn*NUM_DIMS + 1] - cy;
-    // the box is periodic but the star stays far from the boundary
-    if(dx*dx + dy*dy < SD_R_ACC*SD_R_ACC) {
-      sink[gg] = 1;
-      px += m*v[nn*NUM_DIMS + 0];
-      py += m*v[nn*NUM_DIMS + 1];
-      mg += m;
-      for(kk=0; kk<4; kk++) {
-	aff[4*gg + kk] = 0.0;
+  for(s=SPECIES_GAS; s<=SPECIES_DUST; s++) {
+    flag = s == SPECIES_GAS ? sink : dsink;
+    m = species[s].mass;
+    for(gg=0; gg<species[s].count; gg++) {
+      if(flag[gg]) {
+	continue;
       }
-      n_new++;
+      nn = species[s].offset + gg;
+      dx = r[nn*NUM_DIMS + 0] - cx;
+      dy = r[nn*NUM_DIMS + 1] - cy;
+      // the box is periodic but the star stays far from the boundary
+      if(dx*dx + dy*dy < SD_R_ACC*SD_R_ACC) {
+	flag[gg] = 1;
+	px += m*v[nn*NUM_DIMS + 0];
+	py += m*v[nn*NUM_DIMS + 1];
+	mg += m;
+	for(kk=0; kk<4; kk++) {
+	  (s == SPECIES_GAS ? aff : daff)[4*gg + kk] = 0.0;
+	}
+	n_new++;
+      }
     }
   }
 
   if(n_new > 0) {
     v[ns*NUM_DIMS + 0] = px/mg;
     v[ns*NUM_DIMS + 1] = py/mg;
-    for(gg=0; gg<NUM_GAS_PARTICLES; gg++) {
-      if(sink[gg]) {
-	nn = species[SPECIES_GAS].offset + gg;
-	r[nn*NUM_DIMS + 0] = cx;
-	r[nn*NUM_DIMS + 1] = cy;
-	v[nn*NUM_DIMS + 0] = v[ns*NUM_DIMS + 0];
-	v[nn*NUM_DIMS + 1] = v[ns*NUM_DIMS + 1];
+    for(s=SPECIES_GAS; s<=SPECIES_DUST; s++) {
+      flag = s == SPECIES_GAS ? sink : dsink;
+      for(gg=0; gg<species[s].count; gg++) {
+	if(flag[gg]) {
+	  nn = species[s].offset + gg;
+	  r[nn*NUM_DIMS + 0] = cx;
+	  r[nn*NUM_DIMS + 1] = cy;
+	  v[nn*NUM_DIMS + 0] = v[ns*NUM_DIMS + 0];
+	  v[nn*NUM_DIMS + 1] = v[ns*NUM_DIMS + 1];
+	}
       }
     }
   }
@@ -1305,7 +1456,9 @@ void write_star_disk_map(FILE *fp, const double *rho_gas){
 // positions: the gas acceleration towards the star averaged over radial bins
 // of half a cell gives v_phi^2 = -r <a_r>, interpolated linearly between bin
 // centers. This includes the softened mesh gravity of the star, the disk self
-// gravity, the periodic box and the gas pressure. Net momentum is removed so
+// gravity, the periodic box and the gas pressure. Dust takes the rotation
+// of the gas around it, so it feels no drag at first, then sheds the
+// pressure support it lacks and drifts. Net momentum is removed so
 // the center of mass stays at rest, returns the maximum speed
 double set_equilibrium_rotation(double *r, double *v, const double *a){
   int nn, bb, b0;
@@ -1336,7 +1489,8 @@ double set_equilibrium_rotation(double *r, double *v, const double *a){
     prof[bb] = cnt[bb] > 0 ? sum[bb]/(double)(cnt[bb]) : -1.0;
   }
 
-  for(nn=species[SPECIES_GAS].offset; nn<species[SPECIES_GAS].offset + species[SPECIES_GAS].count; nn++) {
+  // dust, placed after the gas, takes the rotation of the gas around it
+  for(nn=species[SPECIES_GAS].offset; nn<species[SPECIES_DUST].offset + species[SPECIES_DUST].count; nn++) {
     dx = r[nn*NUM_DIMS + 0] - cx;
     dy = r[nn*NUM_DIMS + 1] - cy;
     rr = sqrt(dx*dx + dy*dy);
@@ -1362,7 +1516,7 @@ double set_equilibrium_rotation(double *r, double *v, const double *a){
 
   // remove the net momentum of star and gas together
   for(nn=0; nn<NUM_PARTICLES; nn++) {
-    m = nn < species[SPECIES_GAS].offset ? species[SPECIES_DM].mass : species[SPECIES_GAS].mass;
+    m = particle_mass(nn);
     px += m*v[nn*NUM_DIMS + 0];
     py += m*v[nn*NUM_DIMS + 1];
     mtot += m;
@@ -1380,25 +1534,29 @@ double set_equilibrium_rotation(double *r, double *v, const double *a){
 // surface density, mean azimuthal and radial velocity relative to the star,
 // the rms radial velocity and the mass weighted sound speed, header with the
 // star state, the total angular momentum about the center of mass including
-// the APIC spin, the gas thermal energy and the energy radiated so far
+// the APIC spin, the gas thermal energy and the energy radiated so far. With
+// dust three more columns: dust surface density, mean azimuthal and radial
+// dust velocity relative to the star, and the accreted dust mass in the header
 void write_star_disk_profile(FILE *fp, const double *r, const double *v, const double *aff, const double *u,
-			     const unsigned char *sink, double e_rad, double t){
+			     const unsigned char *sink, const unsigned char *dsink, double e_rad, double t){
   int nn, bb;
   int ns = species[SPECIES_DM].offset;
   double cx = r[ns*NUM_DIMS + 0], cy = r[ns*NUM_DIMS + 1];
   double svx = v[ns*NUM_DIMS + 0], svy = v[ns*NUM_DIMS + 1];
   double dx, dy, dvx, dvy, rr, m, mtot = 0.0;
-  double gx = 0.0, gy = 0.0, gvx = 0.0, gvy = 0.0, lz = 0.0, e_th = 0.0, m_acc = 0.0;
+  double gx = 0.0, gy = 0.0, gvx = 0.0, gvy = 0.0, lz = 0.0, e_th = 0.0, m_acc = 0.0, m_acc_dust = 0.0;
   enum { NB = (int)SD_R_OUT + 6*(int)SD_EDGE_OUT + 1 };
   double mass[NB], vphi[NB], vr[NB], vr2[NB], csb[NB];
+  double dmass[NB], dvphi[NB], dvr[NB];
 
   for(bb=0; bb<NB; bb++) {
     mass[bb] = vphi[bb] = vr[bb] = vr2[bb] = csb[bb] = 0.0;
+    dmass[bb] = dvphi[bb] = dvr[bb] = 0.0;
   }
 
   // center of mass position and velocity
   for(nn=0; nn<NUM_PARTICLES; nn++) {
-    m = nn < species[SPECIES_GAS].offset ? species[SPECIES_DM].mass : species[SPECIES_GAS].mass;
+    m = particle_mass(nn);
     gx += m*r[nn*NUM_DIMS + 0];
     gy += m*r[nn*NUM_DIMS + 1];
     gvx += m*v[nn*NUM_DIMS + 0];
@@ -1408,8 +1566,26 @@ void write_star_disk_profile(FILE *fp, const double *r, const double *v, const d
   gx /= mtot; gy /= mtot; gvx /= mtot; gvy /= mtot;
 
   for(nn=0; nn<NUM_PARTICLES; nn++) {
-    m = nn < species[SPECIES_GAS].offset ? species[SPECIES_DM].mass : species[SPECIES_GAS].mass;
+    m = particle_mass(nn);
     lz += m*((r[nn*NUM_DIMS + 0] - gx)*(v[nn*NUM_DIMS + 1] - gvy) - (r[nn*NUM_DIMS + 1] - gy)*(v[nn*NUM_DIMS + 0] - gvx));
+    if(nn >= species[SPECIES_DUST].offset) {
+      if(dsink[nn - species[SPECIES_DUST].offset]) {
+	m_acc_dust += m;
+	continue;
+      }
+      dx = r[nn*NUM_DIMS + 0] - cx;
+      dy = r[nn*NUM_DIMS + 1] - cy;
+      dvx = v[nn*NUM_DIMS + 0] - svx;
+      dvy = v[nn*NUM_DIMS + 1] - svy;
+      rr = sqrt(dx*dx + dy*dy);
+      bb = (int)(rr);
+      if(rr > 0.0 && bb < NB) {
+	dmass[bb] += m;
+	dvphi[bb] += m*(dx*dvy - dy*dvx)/rr;
+	dvr[bb] += m*(dx*dvx + dy*dvy)/rr;
+      }
+      continue;
+    }
     if(nn < species[SPECIES_GAS].offset) {
       continue;
     }
@@ -1440,13 +1616,22 @@ void write_star_disk_profile(FILE *fp, const double *r, const double *v, const d
   // in the middle of the disk
   fprintf(fp, "# t %.6f star_x %.6f star_y %.6f star_vx %.6e star_vy %.6e cm_x %.6f cm_y %.6f Lz %.10e "
 	  "R_in %.3f R_out %.3f edge_out %.3f v_K %.6f cs %.6f disk_to_star %.4f G %.6f gamma %.6f beta %.4f "
-	  "cooling %d Q_init %.4f Q_floor %.4f E_th %.10e E_rad %.10e M_acc %.6e\n",
+	  "cooling %d Q_init %.4f Q_floor %.4f E_th %.10e E_rad %.10e M_acc %.6e",
 	  t, cx, cy, svx, svy, gx, gy, lz, SD_R_IN, SD_R_OUT, SD_EDGE_OUT, SD_V_K, sd_cs_init(0.5*(SD_R_IN + SD_R_OUT)),
 	  SD_DISK_TO_STAR, G_DISK, GAMMA, SD_BETA, SD_COOLING, SD_Q_INIT, SD_Q_FLOOR, e_th, e_rad, m_acc);
+  if(NUM_DUST_PARTICLES > 0) {
+    fprintf(fp, " dust_to_gas %.6f St %.6f M_acc_dust %.6e", DUST_TO_GAS, DUST_ST, m_acc_dust);
+  }
+  fprintf(fp, "\n");
   for(bb=0; bb<NB; bb++) {
     if(mass[bb] > 0.0) {
-      fprintf(fp, "%.2f %.8e %.6e %.6e %.6e %.6e\n", bb + 0.5, mass[bb]/(M_PI*(double)(2*bb + 1)),
+      fprintf(fp, "%.2f %.8e %.6e %.6e %.6e %.6e", bb + 0.5, mass[bb]/(M_PI*(double)(2*bb + 1)),
 	      vphi[bb]/mass[bb], vr[bb]/mass[bb], sqrt(vr2[bb]/mass[bb]), csb[bb]/mass[bb]);
+      if(NUM_DUST_PARTICLES > 0) {
+	fprintf(fp, " %.8e %.6e %.6e", dmass[bb]/(M_PI*(double)(2*bb + 1)),
+		dmass[bb] > 0.0 ? dvphi[bb]/dmass[bb] : 0.0, dmass[bb] > 0.0 ? dvr[bb]/dmass[bb] : 0.0);
+      }
+      fprintf(fp, "\n");
     }
   }
   fprintf(fp, "\n\n");
@@ -1675,6 +1860,386 @@ void write_shock_tube_profile(const char *path, const double *grid_fields, doubl
 }
 #endif
 
+// dust drag fields on the mesh, NUM_DRAG_FIELDS arrays of NUM_CELLS^2
+enum drag_field_id{
+  DRAG_DVG_X = 0,  // gas velocity kick of the drag
+  DRAG_DVG_Y,
+  DRAG_DVD_X,      // dust velocity kick of the drag
+  DRAG_DVD_Y,
+  DRAG_DAMP,       // relaxation 1 - exp(-dt/t_s) of the dust velocity dispersion
+  DRAG_VD_X,       // mass weighted dust velocity including the affine momentum
+  DRAG_VD_Y,
+  DRAG_HEAT,       // kinetic energy change of the drag kick, CIC deposited
+  NUM_DRAG_FIELDS
+};
+
+// dust stopping time at mesh node nn with gas surface density rho_g
+static double dust_stop_time(int nn, double rho_g, const double *r){
+  if(DUST_TS > 0.0) {
+    return DUST_TS;
+  }
+#if STAR_DISK
+  // Epstein drag in a thin disk, St = Omega t_s ~ 1/sigma_gas
+  int ns = species[SPECIES_DM].offset;
+  double dx = (double)(nn % NUM_CELLS) - r[ns*NUM_DIMS + 0];
+  double dy = (double)(nn / NUM_CELLS) - r[ns*NUM_DIMS + 1];
+
+  return DUST_ST*sd_sigma_ref/(rho_g*sd_lookup(sd_omega_tab, sqrt(dx*dx + dy*dy)));
+#else
+  (void)nn;
+  (void)rho_g;
+  (void)r;
+  return 1.0e30;
+#endif
+}
+
+// two-fluid drag at the mesh nodes over the step dt. With dust to gas ratio
+// eps = rho_d/rho_g the gas and dust velocities obey
+//   dv_g/dt = a_g - eps (v_g - v_d)/t_s,   dv_d/dt = a_d - (v_d - v_g)/t_s
+// The center of mass velocity only feels the forces, the relative velocity
+// w = v_g - v_d relaxes on tau = t_s/(1 + eps) towards the terminal value
+// set by the differential acceleration da = a_g - a_d, the gas pressure
+// acceleration (gravity acts on both alike):
+//   w(dt) = da tau + (w0 - da tau) exp(-dt/tau)
+// The kicks of the step already apply da dt, the drag adds
+//   dw = w(dt) - w0 - da dt
+// shared between the species so that momentum is conserved,
+// rho_g dv_g + rho_d dv_d = 0. The solution is exact for any dt/t_s, and
+// keeping da in it gives the terminal drift w = da tau of tightly coupled
+// grains, which a split exponential drag after the force kick would damp
+// away (Lorén-Aguilar and Bate 2015, Yang and Johansen 2016). w0 is the
+// difference of the mass weighted mesh velocities deposited at the half step,
+// both including their APIC affine momentum
+void compute_dust_drag(const double *grid_fields, const double *vel, const double *acc, double *drag,
+		       double dt, const double *r){
+  int nn;
+  double rg, rd, ts, tau, e, wx, wy, dax, day, dwx, dwy;
+  const double *rho_gas = &grid_fields[FIELD_RHO_GAS*NUM_CELLS*NUM_CELLS];
+  const double *rho_dust = &grid_fields[FIELD_RHO_DUST*NUM_CELLS*NUM_CELLS];
+  const double *mx_dust = &grid_fields[FIELD_DUST_MOM_X*NUM_CELLS*NUM_CELLS];
+  const double *my_dust = &grid_fields[FIELD_DUST_MOM_Y*NUM_CELLS*NUM_CELLS];
+  const double *affx_dust = &grid_fields[FIELD_DUST_AFF_X*NUM_CELLS*NUM_CELLS];
+  const double *affy_dust = &grid_fields[FIELD_DUST_AFF_Y*NUM_CELLS*NUM_CELLS];
+  const double *vgx = &vel[0];
+  const double *vgy = &vel[NUM_CELLS*NUM_CELLS];
+  const double *ax = &acc[0];
+  const double *ay = &acc[NUM_CELLS*NUM_CELLS];
+  double *f[NUM_DRAG_FIELDS];
+
+  for(nn=0; nn<NUM_DRAG_FIELDS; nn++) {
+    f[nn] = &drag[nn*NUM_CELLS*NUM_CELLS];
+  }
+
+  for(nn=0; nn<NUM_CELLS*NUM_CELLS; nn++) {
+    rg = rho_gas[nn];
+    rd = rho_dust[nn];
+    f[DRAG_VD_X][nn] = rd > 0.0 ? (mx_dust[nn] + affx_dust[nn])/rd : 0.0;
+    f[DRAG_VD_Y][nn] = rd > 0.0 ? (my_dust[nn] + affy_dust[nn])/rd : 0.0;
+
+    if(rg <= RHO_GAS_FLOOR || rd <= 0.0 || dt <= 0.0) {
+      f[DRAG_DVG_X][nn] = f[DRAG_DVG_Y][nn] = 0.0;
+      f[DRAG_DVD_X][nn] = f[DRAG_DVD_Y][nn] = 0.0;
+      f[DRAG_DAMP][nn] = 0.0;
+      continue;
+    }
+
+    ts = dust_stop_time(nn, rg, r);
+    tau = ts/(1.0 + rd/rg);
+    e = exp(-dt/tau);
+
+    wx = vgx[nn] - f[DRAG_VD_X][nn];
+    wy = vgy[nn] - f[DRAG_VD_Y][nn];
+    dax = ax[nn];
+    day = ay[nn];
+    dwx = -(1.0 - e)*(wx - dax*tau) - dax*dt;
+    dwy = -(1.0 - e)*(wy - day*tau) - day*dt;
+
+    f[DRAG_DVG_X][nn] = rd/(rg + rd)*dwx;
+    f[DRAG_DVG_Y][nn] = rd/(rg + rd)*dwy;
+    f[DRAG_DVD_X][nn] = -rg/(rg + rd)*dwx;
+    f[DRAG_DVD_Y][nn] = -rg/(rg + rd)*dwy;
+    f[DRAG_DAMP][nn] = 1.0 - exp(-dt/ts);
+  }
+}
+
+// drag kick of the particles. Gas particles take the CIC interpolated gas
+// kick. Dust particles take the dust kick and relax their velocity relative
+// to the dust velocity of each node of their stencil,
+//   dv_p = sum_c w_c (dv_d,c - f_c (v_p - V_d,c)),
+// so a dust particle forgets its own velocity on its stopping time, the
+// velocity dispersion of the dust that the node drag cannot see. For grains
+// with t_s << dt (f = 1) this is a full PIC transfer of the dust velocity,
+// whose CIC smoothing would damp resolved dust motion by ~k^2/6 per step, so
+// dust carries an APIC matrix B like the gas: V_d,c includes the deposited
+// affine momentum and B relaxes towards sum_c w_c V'_c (x_c - x_p)^T of the
+// kicked mesh velocity V' = V_d + dv_d with the same fraction f. Summed over
+// particles the relaxation adds sum_c f_c aff_c to the momentum, which vanishes
+// for uniform f (the APIC terms of a particle sum to zero) and is small
+// where f varies slowly. The gas kick and the dust kick conserve momentum
+// exactly. Each particle deposits its kinetic energy change with its CIC
+// weights into the per-thread heat subfield
+void *dust_drag_thread(void *threadarg){
+  int nn, lo, hi, ii, jj, kk, s;
+  struct thread_data *my_data = (struct thread_data *) threadarg;
+  int thread_id = my_data->thread_id;
+  double *r = my_data->r, *v = my_data->v;
+  const double *drag = my_data->drag_mesh;
+  const double *dvgx = &drag[DRAG_DVG_X*NUM_CELLS*NUM_CELLS], *dvgy = &drag[DRAG_DVG_Y*NUM_CELLS*NUM_CELLS];
+  const double *dvdx = &drag[DRAG_DVD_X*NUM_CELLS*NUM_CELLS], *dvdy = &drag[DRAG_DVD_Y*NUM_CELLS*NUM_CELLS];
+  const double *damp = &drag[DRAG_DAMP*NUM_CELLS*NUM_CELLS];
+  const double *vdx = &drag[DRAG_VD_X*NUM_CELLS*NUM_CELLS], *vdy = &drag[DRAG_VD_Y*NUM_CELLS*NUM_CELLS];
+  double *heat = &my_data->sub_heat[thread_id*NUM_CELLS*NUM_CELLS];
+  double dr[2], w[4], gw[4][2], d[4][2];
+  int c[4];
+  double m, vx, vy, dx, dy, dk, ke = 0.0;
+  const double *rho_dust = &my_data->grid_fields[FIELD_RHO_DUST*NUM_CELLS*NUM_CELLS];
+  double fp, bg[4], rho_min, sparse, *bp;
+
+  memset(heat, 0, NUM_CELLS*NUM_CELLS*sizeof(double));
+
+  for(s=SPECIES_GAS; s<=SPECIES_DUST; s++) {
+    m = species[s].mass;
+    thread_slice(species[s].offset, species[s].count, thread_id, NUM_THREADS, &lo, &hi);
+    for(nn=lo; nn<hi; nn++) {
+      if((s == SPECIES_GAS && my_data->sink[nn - species[SPECIES_GAS].offset]) ||
+	 (s == SPECIES_DUST && my_data->dsink[nn - species[SPECIES_DUST].offset])) {
+	continue;
+      }
+      ii = floor(r[nn*NUM_DIMS + 0]);
+      jj = floor(r[nn*NUM_DIMS + 1]);
+      dr[0] = r[nn*NUM_DIMS + 0] - (double)(ii);
+      dr[1] = r[nn*NUM_DIMS + 1] - (double)(jj);
+      cic_stencil(ii, jj, dr, NUM_CELLS, c, w, gw, d);
+
+      vx = v[nn*NUM_DIMS + 0];
+      vy = v[nn*NUM_DIMS + 1];
+      dx = 0.0;
+      dy = 0.0;
+      if(s == SPECIES_GAS) {
+	for(kk=0; kk<4; kk++) {
+	  dx += w[kk]*dvgx[c[kk]];
+	  dy += w[kk]*dvgy[c[kk]];
+	}
+      }
+      else {
+	fp = 0.0;
+	bg[0] = bg[1] = bg[2] = bg[3] = 0.0;
+	rho_min = rho_dust[c[0]];
+	for(kk=0; kk<4; kk++) {
+	  dx += w[kk]*(dvdx[c[kk]] - damp[c[kk]]*(vx - vdx[c[kk]]));
+	  dy += w[kk]*(dvdy[c[kk]] - damp[c[kk]]*(vy - vdy[c[kk]]));
+	  fp += w[kk]*damp[c[kk]];
+	  bg[0] += w[kk]*(vdx[c[kk]] + dvdx[c[kk]])*d[kk][0];
+	  bg[1] += w[kk]*(vdx[c[kk]] + dvdx[c[kk]])*d[kk][1];
+	  bg[2] += w[kk]*(vdy[c[kk]] + dvdy[c[kk]])*d[kk][0];
+	  bg[3] += w[kk]*(vdy[c[kk]] + dvdy[c[kk]])*d[kk][1];
+	  rho_min = fmin(rho_min, rho_dust[c[kk]]);
+	}
+	// near-empty nodes get the same limiter as the gas APIC
+	sparse = fmin(1.0, rho_min/(APIC_SPARSE*m));
+	bp = &my_data->daff[4*(nn - species[SPECIES_DUST].offset)];
+	for(kk=0; kk<4; kk++) {
+	  bp[kk] += fp*(bg[kk] - bp[kk]);
+	  bp[kk] *= sparse;
+	}
+      }
+      v[nn*NUM_DIMS + 0] = vx + dx;
+      v[nn*NUM_DIMS + 1] = vy + dy;
+
+      dk = 0.5*m*(dx*(2.0*vx + dx) + dy*(2.0*vy + dy));
+      ke += dk;
+      for(kk=0; kk<4; kk++) {
+	heat[c[kk]] += w[kk]*dk;
+      }
+    }
+  }
+  my_data->drag_ke = ke;
+
+  pthread_exit(NULL);
+}
+
+// the kinetic energy the drag removed heats the gas: a gas particle gains
+// u += -sum_c w_c H_c/rho_c from the summed heat field H. Summed over the gas
+// with the deposit weights this returns sum_c H_c exactly, except at nodes
+// without gas and at the internal energy floor (the residual drag_ke + drag_heat)
+void *dust_heat_thread(void *threadarg){
+  int nn, lo, hi, ii, jj, kk, gg;
+  struct thread_data *my_data = (struct thread_data *) threadarg;
+  int thread_id = my_data->thread_id;
+  const double *r = my_data->r;
+  double *u = my_data->u;
+  const double *heat = &my_data->drag_mesh[DRAG_HEAT*NUM_CELLS*NUM_CELLS];
+  const double *rho_gas = &my_data->grid_fields[FIELD_RHO_GAS*NUM_CELLS*NUM_CELLS];
+  double dr[2], w[4], gw[4][2], d[4][2];
+  int c[4];
+  double h, u_new, eh = 0.0;
+
+  thread_slice(species[SPECIES_GAS].offset, species[SPECIES_GAS].count, thread_id, NUM_THREADS, &lo, &hi);
+  for(nn=lo; nn<hi; nn++) {
+    gg = nn - species[SPECIES_GAS].offset;
+    if(my_data->sink[gg]) {
+      continue;
+    }
+    ii = floor(r[nn*NUM_DIMS + 0]);
+    jj = floor(r[nn*NUM_DIMS + 1]);
+    dr[0] = r[nn*NUM_DIMS + 0] - (double)(ii);
+    dr[1] = r[nn*NUM_DIMS + 1] - (double)(jj);
+    cic_stencil(ii, jj, dr, NUM_CELLS, c, w, gw, d);
+
+    h = 0.0;
+    for(kk=0; kk<4; kk++) {
+      if(rho_gas[c[kk]] > RHO_GAS_FLOOR) {
+	h -= w[kk]*heat[c[kk]]/rho_gas[c[kk]];
+      }
+    }
+#if !ISOTHERMAL
+    u_new = fmax(u[gg] + h, U_MIN);
+    eh += u_new - u[gg];
+    u[gg] = u_new;
+#else
+    (void)u_new;
+    (void)u;
+#endif
+  }
+  my_data->drag_heat = species[SPECIES_GAS].mass*eh;
+
+  pthread_exit(NULL);
+}
+
+#if DUSTY_BOX
+// displacement, velocity and adiabatic internal energy factor of the sound
+// wave at lattice position x0: the density is rho0/(1 + dxi/dx0) =
+// rho0 (1 + DB_AMP sin(k x)) to first order, the gas velocity of a wave
+// travelling to +x is cs drho/rho and u ~ rho^(gamma - 1), so the wave
+// carries no entropy perturbation
+static void dusty_wave(double x0, double *x, double *vx, double *fu){
+#if DB_WAVE
+  *x = x0 + DB_AMP/DB_K*cos(DB_K*x0);
+  *vx = DB_CS*DB_AMP*sin(DB_K*x0);
+  *fu = 1.0 + (GAMMA - 1.0)*DB_AMP*sin(DB_K*x0);
+#else
+  *x = x0;
+  *vx = 0.0;
+  *fu = 1.0;
+#endif
+}
+
+// uniform gas at rest and dust moving with DB_V0 along x on DB_PPC_X by
+// DB_PPC_Y lattices, or both carrying the sound wave
+void init_dusty_box(double *r, double *v, double *a, double *u, double *du){
+  int ii, jj, px, py;
+  int nn = species[SPECIES_GAS].offset;
+  double x, vx, fu;
+
+  for(jj=0; jj<NUM_CELLS; jj++) {
+    for(ii=0; ii<NUM_CELLS; ii++) {
+      for(py=0; py<DB_PPC_Y; py++) {
+	for(px=0; px<DB_PPC_X; px++) {
+	  dusty_wave(ii + (px + 0.5)/DB_PPC_X, &x, &vx, &fu);
+	  r[nn*NUM_DIMS + 0] = wrap_periodic(x, (double)(NUM_CELLS));
+	  r[nn*NUM_DIMS + 1] = jj + (py + 0.5)/DB_PPC_Y;
+	  v[nn*NUM_DIMS + 0] = vx;
+	  v[nn*NUM_DIMS + 1] = 0.0;
+	  u[nn - species[SPECIES_GAS].offset] = fu*DB_CS*DB_CS/(GAMMA*(GAMMA - 1.0));
+	  du[nn - species[SPECIES_GAS].offset] = 0.0;
+	  nn++;
+	}
+      }
+    }
+  }
+  for(jj=0; jj<NUM_CELLS; jj++) {
+    for(ii=0; ii<NUM_CELLS; ii++) {
+      for(py=0; py<DB_PPC_Y; py++) {
+	for(px=0; px<DB_PPC_X; px++) {
+	  dusty_wave(ii + (px + 0.5)/DB_PPC_X, &x, &vx, &fu);
+	  r[nn*NUM_DIMS + 0] = wrap_periodic(x, (double)(NUM_CELLS));
+	  r[nn*NUM_DIMS + 1] = jj + (py + 0.5)/DB_PPC_Y;
+	  v[nn*NUM_DIMS + 0] = DB_V0 + vx;
+	  v[nn*NUM_DIMS + 1] = 0.0;
+	  nn++;
+	}
+      }
+    }
+  }
+  for(nn=0; nn<NUM_PARTICLES; nn++) {
+    a[nn*NUM_DIMS + 0] = 0.0;
+    a[nn*NUM_DIMS + 1] = 0.0;
+  }
+}
+
+// one line per step: time, mass weighted gas and dust velocity along x and
+// y, total momentum along x, kinetic and thermal energy, cumulative residual
+// of the drag heating
+void write_dusty_box(FILE *fp, const double *v, const double *u, double t, double dt, double e_drag_res){
+  int nn, s;
+  double p[NUM_SPECIES][2], ke = 0.0, eth = 0.0, m;
+
+  for(s=0; s<NUM_SPECIES; s++) {
+    p[s][0] = p[s][1] = 0.0;
+    m = species[s].mass;
+    for(nn=species[s].offset; nn<species[s].offset + species[s].count; nn++) {
+      p[s][0] += m*v[nn*NUM_DIMS + 0];
+      p[s][1] += m*v[nn*NUM_DIMS + 1];
+      ke += 0.5*m*(v[nn*NUM_DIMS + 0]*v[nn*NUM_DIMS + 0] + v[nn*NUM_DIMS + 1]*v[nn*NUM_DIMS + 1]);
+    }
+  }
+  for(nn=0; nn<NUM_GAS_PARTICLES; nn++) {
+    eth += GAS_MASS*u[nn];
+  }
+  if(t == 0.0) {
+    fprintf(fp, "# eps %.10g t_s %.10g v0 %.10g dt %.10g gamma %.10g\n", DB_EPS, DUST_TS, DB_V0, dt, GAMMA);
+    fprintf(fp, "# t v_gas_x v_gas_y v_dust_x v_dust_y p_x E_kin E_th drag_res\n");
+  }
+  fprintf(fp, "%.10e %.15e %.15e %.15e %.15e %.15e %.15e %.15e %.6e\n", t,
+	  p[SPECIES_GAS][0]/(GAS_MASS*NUM_GAS_PARTICLES), p[SPECIES_GAS][1]/(GAS_MASS*NUM_GAS_PARTICLES),
+	  p[SPECIES_DUST][0]/(DUST_MASS*NUM_DUST_PARTICLES), p[SPECIES_DUST][1]/(DUST_MASS*NUM_DUST_PARTICLES),
+	  p[SPECIES_GAS][0] + p[SPECIES_DUST][0], ke, eth, e_drag_res);
+  fflush(fp);
+}
+
+#if DB_WAVE
+// one line per step: time and the Fourier coefficients at the wave number
+// DB_K of the gas and dust density and momentum, normalized by the species
+// mass, sum_p m exp(-i k x_p)/M and sum_p m v_p exp(-i k x_p)/M as real and
+// imaginary parts
+void write_dusty_wave(FILE *fp, const double *r, const double *v, const double *u, double t){
+  int nn, s, kk = 0;
+  double out[8], ph, m, mt, eth = 0.0;
+
+  for(s=SPECIES_GAS; s<=SPECIES_DUST; s++) {
+    double dr = 0.0, di = 0.0, pr = 0.0, pi = 0.0;
+    m = species[s].mass;
+    mt = m*(double)(species[s].count);
+    for(nn=species[s].offset; nn<species[s].offset + species[s].count; nn++) {
+      ph = DB_K*r[nn*NUM_DIMS + 0];
+      dr += cos(ph);
+      di -= sin(ph);
+      pr += v[nn*NUM_DIMS + 0]*cos(ph);
+      pi -= v[nn*NUM_DIMS + 0]*sin(ph);
+    }
+    out[kk++] = m*dr/mt;
+    out[kk++] = m*di/mt;
+    out[kk++] = m*pr/mt;
+    out[kk++] = m*pi/mt;
+  }
+  for(nn=0; nn<NUM_GAS_PARTICLES; nn++) {
+    eth += GAS_MASS*u[nn];
+  }
+  if(t == 0.0) {
+    fprintf(fp, "# eps %.10g t_s %.10g cs %.10g k %.10g amp %.10g gamma %.10g dt %.10g\n",
+	    DB_EPS, DUST_TS, DB_CS, DB_K, DB_AMP, GAMMA, DT);
+    fprintf(fp, "# t gas_rho_re gas_rho_im gas_mom_re gas_mom_im dust_rho_re dust_rho_im dust_mom_re dust_mom_im E_th\n");
+  }
+  fprintf(fp, "%.10e", t);
+  for(kk=0; kk<8; kk++) {
+    fprintf(fp, " %.12e", out[kk]);
+  }
+  fprintf(fp, " %.15e\n", eth);
+  fflush(fp);
+}
+#endif
+#endif
+
 /* compute time difference in seconds and nanoseconds */
 void timediff(struct timespec start, struct timespec end, struct timespec *out){
   /* compute time difference */
@@ -1705,9 +2270,11 @@ int main(int argc, char *argv[])
 
   
   double *rho, *sub_rho, *rho_species;
-  double *u, *du, *aff;
-  unsigned char *sink;
+  double *u, *du, *aff, *daff;
+  unsigned char *sink, *dsink;
   double *press, *du_mesh, *gas_vel, *gas_acc;
+  double *drag_mesh, *sub_heat;
+  double e_drag_ke = 0.0, e_drag_res = 0.0;
   double cs_max, v_max, e_thermal;
   double p_res, e_flip_loss = 0.0, e_work_res = 0.0;
   double acc;
@@ -1813,7 +2380,9 @@ int main(int argc, char *argv[])
   du=(double *)malloc(NUM_GAS_PARTICLES*sizeof(double));
   aff=(double *)calloc(4*(NUM_GAS_PARTICLES > 0 ? NUM_GAS_PARTICLES : 1), sizeof(double));
   sink=(unsigned char *)calloc(NUM_GAS_PARTICLES > 0 ? NUM_GAS_PARTICLES : 1, sizeof(unsigned char));
-  if(!u || !du || !aff || !sink){
+  dsink=(unsigned char *)calloc(NUM_DUST_PARTICLES > 0 ? NUM_DUST_PARTICLES : 1, sizeof(unsigned char));
+  daff=(double *)calloc(4*(NUM_DUST_PARTICLES > 0 ? NUM_DUST_PARTICLES : 1), sizeof(double));
+  if(!u || !du || !aff || !sink || !dsink || !daff){
     printf("Out of memory: u or du not allocated.\n");
     exit(1);
   }
@@ -1826,6 +2395,22 @@ int main(int argc, char *argv[])
     printf("Out of memory: gas pressure fields not allocated.\n");
     exit(1);
   }
+  // dust drag fields and per-thread heat subfields
+#if NUM_DUST_PARTICLES > 0
+  drag_mesh=(double *)malloc(NUM_DRAG_FIELDS*NUM_CELLS*NUM_CELLS*sizeof(double));
+  sub_heat=(double *)malloc(NUM_THREADS*NUM_CELLS*NUM_CELLS*sizeof(double));
+  if(!drag_mesh || !sub_heat){
+    printf("Out of memory: dust drag fields not allocated.\n");
+    exit(1);
+  }
+#else
+  drag_mesh=NULL;
+  sub_heat=NULL;
+  (void)drag_mesh;
+  (void)sub_heat;
+  (void)e_drag_ke;
+  (void)e_drag_res;
+#endif
   // potential
   phi=(double *)malloc(NUM_CELLS*NUM_CELLS*sizeof(double));
   if(!phi){
@@ -1869,6 +2454,8 @@ int main(int argc, char *argv[])
   init_shock_tube(r, v, a, u, du);
 #elif GAS_CLOUD
   init_gas_cloud(r, v, a, u, du);
+#elif DUSTY_BOX
+  init_dusty_box(r, v, a, u, du);
 #else
   init_star_disk(r, v, a, u, du);
 #endif
@@ -1981,8 +2568,9 @@ int main(int argc, char *argv[])
   double e_rad = 0.0;
   FILE *disk_fp = fopen("stardisk.dat", "w");
   FILE *map_fp = fopen("stardisk_rho.bin", "wb");
-  if(!disk_fp || !map_fp) {
-    printf("Could not open stardisk.dat or stardisk_rho.bin for writing.\n");
+  FILE *dust_map_fp = NUM_DUST_PARTICLES > 0 ? fopen("stardisk_dust.bin", "wb") : NULL;
+  if(!disk_fp || !map_fp || (NUM_DUST_PARTICLES > 0 && !dust_map_fp)) {
+    printf("Could not open stardisk.dat, stardisk_rho.bin or stardisk_dust.bin for writing.\n");
     exit(1);
   }
   printf("star disk: disk/star mass %.3f, R %.1f - %.1f cells, Q_init %.2f, cooling %d beta %.2f Q_floor %.2f\n"
@@ -1990,9 +2578,26 @@ int main(int argc, char *argv[])
 	 SD_DISK_TO_STAR, SD_R_IN, SD_R_OUT, SD_Q_INIT, SD_COOLING, SD_BETA, SD_Q_FLOOR,
 	 sd_cs_init(SD_R_IN + SD_EDGE_IN), 2.0*M_PI/sd_lookup(sd_omega_tab, SD_R_IN),
 	 sd_cs_init(SD_R_OUT), 2.0*M_PI/sd_lookup(sd_omega_tab, SD_R_OUT));
+  if(NUM_DUST_PARTICLES > 0) {
+    printf("           dust: %d particles, dust/gas mass %.4f, St %.3f at the initial gas surface density at r %.1f\n",
+	   NUM_DUST_PARTICLES, DUST_TO_GAS, DUST_ST, 0.5*(SD_R_IN + SD_R_OUT));
+  }
   dt = 0.0;
 #endif
   
+#if DUSTY_BOX
+  FILE *box_fp = fopen(DB_WAVE ? "dustywave.dat" : "dustybox.dat", "w");
+  if(!box_fp) {
+    printf("Could not open the dusty box output for writing.\n");
+    exit(1);
+  }
+#if DB_WAVE
+  write_dusty_wave(box_fp, r, v, u, 0.0);
+#else
+  write_dusty_box(box_fp, v, u, 0.0, dt, 0.0);
+#endif
+#endif
+
 #if TIFF_ENABLE
   tiff_frame=0;
 #endif
@@ -2083,6 +2688,8 @@ int main(int argc, char *argv[])
       thread_data_array[nn].u=u;
       thread_data_array[nn].aff=aff;
       thread_data_array[nn].sink=sink;
+      thread_data_array[nn].dsink=dsink;
+      thread_data_array[nn].daff=daff;
       thread_data_array[nn].rho=sub_rho;
 
       thread_rc=pthread_create(&threads[nn], &attr, compute_rho_field_thread, (void *) &thread_data_array[nn]);
@@ -2248,6 +2855,37 @@ int main(int argc, char *argv[])
     }
     e_work_res += p_res*dt;
 
+#if NUM_DUST_PARTICLES > 0
+    // gas-dust drag: exact two-fluid solution at the mesh nodes, kicks of the
+    // particles and the dissipated kinetic energy returned to the gas
+    compute_dust_drag(rho_species, gas_vel, gas_acc, drag_mesh, dt, r);
+    for(nn=0;nn<NUM_THREADS;nn++){
+      thread_data_array[nn].thread_id=nn;
+      thread_data_array[nn].r=r;
+      thread_data_array[nn].v=v;
+      thread_data_array[nn].u=u;
+      thread_data_array[nn].sink=sink;
+      thread_data_array[nn].dsink=dsink;
+      thread_data_array[nn].daff=daff;
+      thread_data_array[nn].drag_mesh=drag_mesh;
+      thread_data_array[nn].sub_heat=sub_heat;
+      thread_data_array[nn].grid_fields=rho_species;
+    }
+    run_threads(dust_drag_thread);
+    for(ii=0;ii<NUM_CELLS*NUM_CELLS;ii++){
+      acc = 0.0;
+      for(nn=0;nn<NUM_THREADS;nn++){
+	acc += sub_heat[nn*NUM_CELLS*NUM_CELLS + ii];
+      }
+      drag_mesh[DRAG_HEAT*NUM_CELLS*NUM_CELLS + ii] = acc;
+    }
+    run_threads(dust_heat_thread);
+    for(nn=0;nn<NUM_THREADS;nn++){
+      e_drag_ke += thread_data_array[nn].drag_ke;
+      e_drag_res += thread_data_array[nn].drag_ke + thread_data_array[nn].drag_heat;
+    }
+#endif
+
     // create kick integration threads
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
@@ -2285,8 +2923,11 @@ int main(int argc, char *argv[])
       v_max = set_equilibrium_rotation(r, v, a);
       setup_pass = 0;
       dt = fmin(DT, CFL_TARGET/(cs_max + v_max));
-      write_star_disk_profile(disk_fp, r, v, aff, u, sink, e_rad, 0.0);
+      write_star_disk_profile(disk_fp, r, v, aff, u, sink, dsink, e_rad, 0.0);
       write_star_disk_map(map_fp, &rho_species[FIELD_RHO_GAS*NUM_CELLS*NUM_CELLS]);
+      if(dust_map_fp) {
+	write_star_disk_map(dust_map_fp, &rho_species[FIELD_RHO_DUST*NUM_CELLS*NUM_CELLS]);
+      }
       continue;
     }
 #endif
@@ -2318,7 +2959,9 @@ int main(int argc, char *argv[])
 	  // get field value
 	  d=NUM_PARTICLES*4.0*rho[jj*NUM_CELLS+ii];
 #if DISPLAY_SPECIES
-	  d_dm=display_scale[SPECIES_DM]*rho_species[SPECIES_DM*NUM_CELLS*NUM_CELLS + jj*NUM_CELLS+ii];
+	  // dust shares the blue channel with the collisionless species
+	  d_dm=display_scale[SPECIES_DM]*rho_species[SPECIES_DM*NUM_CELLS*NUM_CELLS + jj*NUM_CELLS+ii] +
+	    display_scale[SPECIES_DUST]*rho_species[SPECIES_DUST*NUM_CELLS*NUM_CELLS + jj*NUM_CELLS+ii];
 	  d_gas=display_scale[SPECIES_GAS]*rho_species[SPECIES_GAS*NUM_CELLS*NUM_CELLS + jj*NUM_CELLS+ii];
 	  d_dm=fmin(fmax(d_dm, 0.0), 255.0);
 	  d_gas=fmin(fmax(d_gas, 0.0), 255.0);
@@ -2377,6 +3020,9 @@ int main(int argc, char *argv[])
 	     sim_time, dt,
 	     (int)(steps/((double)(int_time.tv_sec)+(double)(int_time.tv_nsec)*1.0E-9)),
 	     e_thermal, cs_max, v_max, (cs_max + v_max)*dt);
+#if NUM_DUST_PARTICLES > 0
+      printf("dust drag: kinetic energy change %.6e, not returned as heat %.3e\n", e_drag_ke, e_drag_res);
+#endif
 
 #if TIFF_ENABLE
       sprintf(filename, "/home/janne808/testrun/%08d.tif", tiff_frame++);
@@ -2395,7 +3041,7 @@ int main(int argc, char *argv[])
     e_rad += cool_star_disk(r, u, sink, dt);
 #endif
     // accretion of gas onto the star
-    accrete_star_disk(r, v, aff, sink);
+    accrete_star_disk(r, v, aff, sink, dsink, daff);
 #endif
 
     // adaptive time step for the next step from the gas CFL condition,
@@ -2424,13 +3070,24 @@ int main(int argc, char *argv[])
 
 #if STAR_DISK
     if(sim_time >= next_disk_out - 1.0e-12) {
-      write_star_disk_profile(disk_fp, r, v, aff, u, sink, e_rad, sim_time);
+      write_star_disk_profile(disk_fp, r, v, aff, u, sink, dsink, e_rad, sim_time);
       write_star_disk_map(map_fp, &rho_species[FIELD_RHO_GAS*NUM_CELLS*NUM_CELLS]);
+      if(dust_map_fp) {
+	write_star_disk_map(dust_map_fp, &rho_species[FIELD_RHO_DUST*NUM_CELLS*NUM_CELLS]);
+      }
       next_disk_out += SD_OUT_DT;
     }
     if(sim_time + dt > next_disk_out) {
       dt = next_disk_out - sim_time;
     }
+#endif
+
+#if DUSTY_BOX
+#if DB_WAVE
+    write_dusty_wave(box_fp, r, v, u, sim_time);
+#else
+    write_dusty_box(box_fp, v, u, sim_time, dt, e_drag_res);
+#endif
 #endif
 
     // stop at T_END, last step is shortened to land on it
@@ -2455,9 +3112,15 @@ int main(int argc, char *argv[])
 #if GAS_CLOUD
   fclose(cloud_fp);
 #endif
+#if DUSTY_BOX
+  fclose(box_fp);
+#endif
 #if STAR_DISK
   fclose(disk_fp);
   fclose(map_fp);
+  if(dust_map_fp) {
+    fclose(dust_map_fp);
+  }
 #endif
 
   // clean up FFTW

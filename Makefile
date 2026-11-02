@@ -54,9 +54,9 @@ fishstep: 	$(OBJ)
 fishstep.o:	fishstep.c
 	$(CC) $(OPTS) $(CFLAGS) $(SDL_OPTS) $(TIFFLIB_OPTS) $(FFTW3_OPTS) -c $<
 
-.PHONY: clean shocktube gascloud stardisk
+.PHONY: clean shocktube gascloud stardisk dustybox
 clean:
-	rm -f *.o fishstep fishstep_shocktube fishstep_gascloud fishstep_stardisk
+	rm -f *.o fishstep fishstep_shocktube fishstep_gascloud fishstep_stardisk fishstep_dustybox
 
 # Sod shock tube test: gas only, no gravity, no window, writes shocktube.dat
 fishstep_shocktube:	fishstep.c fishstep.h
@@ -75,6 +75,16 @@ fishstep_gascloud:	fishstep.c fishstep.h
 gascloud:	fishstep_gascloud
 	./fishstep_gascloud
 	python3 tests/gascloud.py gascloud.dat
+
+
+# gas-dust drag: uniform gas and dust streaming through each other, no
+# gravity, no window, writes dustybox.dat
+fishstep_dustybox:	fishstep.c fishstep.h
+	$(CC) -o $@ fishstep.c $(OPTS) -DDUSTY_BOX=1 -DSDL=0 $(CFLAGS) $(FFTW3_OPTS)
+
+dustybox:	fishstep_dustybox
+	./fishstep_dustybox
+	python3 tests/dustybox.py dustybox.dat
 
 
 # cooling protostellar disk, the default setup without a window for about

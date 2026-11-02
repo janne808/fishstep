@@ -28,7 +28,8 @@
 enum species_id{
   SPECIES_DM = 0,   // collisionless (dark matter / stars)
   SPECIES_GAS = 1,  // gas, to be coupled to PIC hydrodynamics
-  NUM_SPECIES = 2
+  SPECIES_DUST = 2, // pressureless dust superparticles coupled to the gas by drag
+  NUM_SPECIES = 3
 };
 
 // mesh fields deposited from particles with cloud in cell weights
@@ -36,11 +37,16 @@ enum species_id{
 enum grid_field_id{
   FIELD_RHO_DM = SPECIES_DM,
   FIELD_RHO_GAS = SPECIES_GAS,
+  FIELD_RHO_DUST = SPECIES_DUST,
   FIELD_GAS_ENERGY = NUM_SPECIES,  // gas internal energy density, sum of m*u
   FIELD_GAS_MOM_X,                 // gas momentum density, sum of m*v_x
   FIELD_GAS_MOM_Y,                 // gas momentum density, sum of m*v_y
   FIELD_GAS_AFF_X,                 // APIC affine momentum, sum of m*(B grad(w))_x
   FIELD_GAS_AFF_Y,                 // APIC affine momentum, sum of m*(B grad(w))_y
+  FIELD_DUST_MOM_X,                // dust momentum density, sum of m*v_x
+  FIELD_DUST_MOM_Y,                // dust momentum density, sum of m*v_y
+  FIELD_DUST_AFF_X,                // dust APIC affine momentum, sum of m*(B grad(w))_x
+  FIELD_DUST_AFF_Y,                // dust APIC affine momentum, sum of m*(B grad(w))_y
   NUM_GRID_FIELDS
 };
 
@@ -77,10 +83,19 @@ struct thread_data{
   // B_ab = sum_c w_c V_c,a (x_c - x_p)_b, the particle velocity field around
   // x_p is v_p + B D^-1 (x - x_p) with D = sum_c w_c (x_c - x_p)(x_c - x_p)^T
   double *aff;
+  // the same for dust particles, indexed by dust particle number
+  double *daff;
 
   // nonzero for gas particles accreted by a sink (the star of the disk
   // problem): they move with it and deposit into the collisionless density
   unsigned char *sink;
+  // the same for dust particles, indexed by dust particle number
+  unsigned char *dsink;
+
+  // dust drag on the mesh (see compute_dust_drag) and the per-thread
+  // subfields that collect the kinetic energy change of the drag kick
+  double *drag_mesh;
+  double *sub_heat;
 
   // summed mesh fields, gas pressure acceleration, mass weighted gas
   // velocity including the APIC affine momentum (first two of the four
@@ -92,6 +107,10 @@ struct thread_data{
 
   // kinetic energy removed by FLIP blending minus the heat returned, per thread
   double flip_loss;
+
+  // kinetic energy change of the drag kick and the heat returned, per thread
+  double drag_ke;
+  double drag_heat;
 
   double dt;
 };
