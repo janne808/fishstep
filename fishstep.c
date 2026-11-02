@@ -351,12 +351,25 @@
 #define RHO_ACC_EDGE 0.5
 
 // von Neumann-Richtmyer artificial viscosity, linear and quadratic terms,
-// applied in converging flow only. It acts through the cell faces with the
+// applied in converging flow only. It acts through the cell faces, measuring
+// the compression with the velocity divergence at the face: the normal
 // velocity jump across the face, a compact difference that also damps the
 // odd-even velocity mode the central difference pressure force cannot see
-// and APIC transfers do not filter
+// and APIC transfers do not filter, plus the tangential derivative of the
+// tangential velocity, central differences averaged over the two cells. The
+// normal jump alone sees compression in pure shear, in a Keplerian disk
+// dvx/dx = -dvy/dy = 3/4 Omega sin(2 phi) per cell, and heats the disk on a
+// fraction of an orbit where its scale height is unresolved. AV_FACE_DIV 0
+// returns to the normal jump alone
+#ifndef AV_FACE_DIV
+#define AV_FACE_DIV 1
+#endif
+#ifndef Q_LIN
 #define Q_LIN 0.5
+#endif
+#ifndef Q_QUAD
 #define Q_QUAD 2.0
+#endif
 
 // FLIP/PIC blending: each step gas particle velocities relax by this fraction
 // towards the mass weighted mesh velocity, 0 is pure FLIP (particles keep
@@ -870,9 +883,9 @@ static inline double face_lambda(double rho_i, double rho_j){
 }
 
 // artificial viscous pressure of the face between cells i and j with
-// densities rho_i, rho_j, thermal pressures p_i, p_j and normal velocity jump
-// dv = v_j - v_i, nonzero in compression only, symmetric under exchanging
-// the cells so both cells see the same value
+// densities rho_i, rho_j, thermal pressures p_i, p_j and face velocity
+// divergence dv (times the cell size), nonzero in compression only,
+// symmetric under exchanging the cells so both cells see the same value
 static inline double face_q(double rho_i, double rho_j, double p_i, double p_j, double dv){
   double cs;
 
@@ -900,6 +913,10 @@ void compute_gas_pressure(const double *grid_fields, double *press, double *du_m
   double l_xm, l_xp, l_ym, l_yp;
   double q_xm, q_xp, q_ym, q_yp;
   double dv_xm, dv_xp, dv_ym, dv_yp;
+  // central differences dvx/dx and dvy/dy per cell for the tangential part
+  // of the face divergence
+  static double dxvx[NUM_CELLS*NUM_CELLS], dyvy[NUM_CELLS*NUM_CELLS];
+  double tg_xm, tg_xp, tg_ym, tg_yp;
 
   const double *rho_gas = &grid_fields[FIELD_RHO_GAS*NUM_CELLS*NUM_CELLS];
   const double *e_gas = &grid_fields[FIELD_GAS_ENERGY*NUM_CELLS*NUM_CELLS];
@@ -974,6 +991,20 @@ void compute_gas_pressure(const double *grid_fields, double *press, double *du_m
     }
   }
 
+  // tangential derivatives of the particle velocity part of the mesh velocity
+  for(jj=0; jj<NUM_CELLS; jj++) {
+    for(ii=0; ii<NUM_CELLS; ii++) {
+      nn = jj*NUM_CELLS + ii;
+#if AV_FACE_DIV
+      dxvx[nn] = 0.5*(vx[jj*NUM_CELLS + modulo(ii+1, NUM_CELLS)] - vx[jj*NUM_CELLS + modulo(ii-1, NUM_CELLS)]);
+      dyvy[nn] = 0.5*(vy[modulo(jj+1, NUM_CELLS)*NUM_CELLS + ii] - vy[modulo(jj-1, NUM_CELLS)*NUM_CELLS + ii]);
+#else
+      dxvx[nn] = 0.0;
+      dyvy[nn] = 0.0;
+#endif
+    }
+  }
+
   // face pressure forces, acceleration f_c/rho_c and specific internal energy
   // rate at the mesh nodes. With lambda = 1 this is the central difference
   // -grad(P)/rho and -(P/rho) div(v). Each face exchanges equal and opposite
@@ -1007,10 +1038,17 @@ void compute_gas_pressure(const double *grid_fields, double *press, double *du_m
       dv_ym = vy[nn] - vy[nym];
       dv_yp = vy[nyp] - vy[nn];
 
-      q_xm = face_q(rho_gas[nxm], rho, press[nxm], press[nn], dv_xm);
-      q_xp = face_q(rho, rho_gas[nxp], press[nn], press[nxp], dv_xp);
-      q_ym = face_q(rho_gas[nym], rho, press[nym], press[nn], dv_ym);
-      q_yp = face_q(rho, rho_gas[nyp], press[nn], press[nyp], dv_yp);
+      // face divergence: normal jump plus the tangential derivative
+      // averaged over the two cells of the face
+      tg_xm = 0.5*(dyvy[nxm] + dyvy[nn]);
+      tg_xp = 0.5*(dyvy[nn] + dyvy[nxp]);
+      tg_ym = 0.5*(dxvx[nym] + dxvx[nn]);
+      tg_yp = 0.5*(dxvx[nn] + dxvx[nyp]);
+
+      q_xm = face_q(rho_gas[nxm], rho, press[nxm], press[nn], dv_xm + tg_xm);
+      q_xp = face_q(rho, rho_gas[nxp], press[nn], press[nxp], dv_xp + tg_xp);
+      q_ym = face_q(rho_gas[nym], rho, press[nym], press[nn], dv_ym + tg_ym);
+      q_yp = face_q(rho, rho_gas[nyp], press[nn], press[nyp], dv_yp + tg_yp);
 
       ax[nn] = (l_xm*(0.5*(press[nxm] + press[nn]) + q_xm) - l_xp*(0.5*(press[nn] + press[nxp]) + q_xp))/rho;
       ay[nn] = (l_ym*(0.5*(press[nym] + press[nn]) + q_ym) - l_yp*(0.5*(press[nn] + press[nyp]) + q_yp))/rho;
