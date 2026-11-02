@@ -1620,7 +1620,7 @@ void write_star_disk_profile(FILE *fp, const double *r, const double *v, const d
 	  t, cx, cy, svx, svy, gx, gy, lz, SD_R_IN, SD_R_OUT, SD_EDGE_OUT, SD_V_K, sd_cs_init(0.5*(SD_R_IN + SD_R_OUT)),
 	  SD_DISK_TO_STAR, G_DISK, GAMMA, SD_BETA, SD_COOLING, SD_Q_INIT, SD_Q_FLOOR, e_th, e_rad, m_acc);
   if(NUM_DUST_PARTICLES > 0) {
-    fprintf(fp, " dust_to_gas %.6f St %.6f M_acc_dust %.6e", DUST_TO_GAS, DUST_ST, m_acc_dust);
+    fprintf(fp, " dust_to_gas %.6f St %.6f M_acc_dust %.6e", (double)(DUST_TO_GAS), (double)(DUST_ST), m_acc_dust);
   }
   fprintf(fp, "\n");
   for(bb=0; bb<NB; bb++) {
@@ -2580,7 +2580,7 @@ int main(int argc, char *argv[])
 	 sd_cs_init(SD_R_OUT), 2.0*M_PI/sd_lookup(sd_omega_tab, SD_R_OUT));
   if(NUM_DUST_PARTICLES > 0) {
     printf("           dust: %d particles, dust/gas mass %.4f, St %.3f at the initial gas surface density at r %.1f\n",
-	   NUM_DUST_PARTICLES, DUST_TO_GAS, DUST_ST, 0.5*(SD_R_IN + SD_R_OUT));
+	   NUM_DUST_PARTICLES, (double)(DUST_TO_GAS), (double)(DUST_ST), 0.5*(SD_R_IN + SD_R_OUT));
   }
   dt = 0.0;
 #endif
